@@ -29,7 +29,7 @@ scindra-engine --version
    Run the smoke script so lint, typecheck, tests, build, twine check, and a local wheel install are exercised before tagging:
    - **mac/Linux:** `./scripts/smoke_release_local.sh`
    - **Windows:** `./scripts/smoke_release_local.ps1`  
-   Requires [uv](https://docs.astral.sh/uv/) and Python 3.11.
+   Requires [uv](https://docs.astral.sh/uv/) and Python 3.11. For full wheelhouse/offline validation (constraints + offline install), run `./scripts/smoke_constraints_wheelhouse_local.sh` or `./scripts/smoke_constraints_wheelhouse_local.ps1` (requires Python 3.11+ and pip only).
 
 3. **Tag**  
    Create a tag that matches the version in `pyproject.toml` (with a `v` prefix), e.g.:
@@ -44,8 +44,14 @@ scindra-engine --version
    ```
 
 5. **Where artifacts appear**  
-   - **GitHub:** The tag’s [Releases](https://docs.github.com/en/repositories/releasing-projects-on-github) page will have the sdist and wheel attached.
+   - **GitHub:** The tag’s [Releases](https://docs.github.com/en/repositories/releasing-projects-on-github) page will have the sdist, wheel, and `constraints-desktop.txt` attached.
    - **PyPI:** The package will be published to [PyPI](https://pypi.org/project/scindra-engine/) once the workflow completes.
+
+### constraints-desktop.txt and Desktop Pro wheelhouse
+
+`constraints-desktop.txt` is a pip constraints file generated from the built wheel’s resolved environment: after installing the wheel in a temporary venv, we run `pip freeze` and strip `pip`, `setuptools`, `wheel`, and the project itself. The result pins exact versions of the runtime dependencies only, so `pip download -c constraints-desktop.txt <wheel>` uses the same dependency versions every time without conflicting with the local wheel.
+
+**Desktop Pro** bundles an offline wheelhouse per platform. It downloads `constraints-desktop.txt` from the GitHub Release and uses it with `pip download -c constraints-desktop.txt ...` when building the wheelhouse, so the same dependency versions are used every time. The file is not published to PyPI; it is only attached to the GitHub Release.
 
 ### PyPI publishing (Trusted Publishing / OIDC)
 

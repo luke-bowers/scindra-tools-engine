@@ -42,6 +42,11 @@ jobs:
       - name: Twine check
         run: uv run twine check dist/*
 
+      - name: Generate constraints-desktop.txt
+        run: |
+          WHEEL=$(ls dist/scindra_engine-*.whl)
+          uv run python scripts/generate_constraints_desktop.py --wheel "$WHEEL" --out constraints-desktop.txt
+
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         # Uses OIDC when no username/password are set. Configure Trusted Publishing
@@ -56,6 +61,7 @@ jobs:
           files: |
             dist/*.whl
             dist/*.tar.gz
+            constraints-desktop.txt
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

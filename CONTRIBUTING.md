@@ -27,6 +27,7 @@ The project uses [uv](https://docs.astral.sh/uv/) for fast, reproducible install
 ## Running checks
 
 - **Lint:** `ruff check .` (or `make lint`; with uv: `uv run ruff check .`)
+- **Wheelhouse smoke (optional):** For full constraints + offline wheelhouse validation, run `./scripts/smoke_constraints_wheelhouse_local.sh` or `./scripts/smoke_constraints_wheelhouse_local.ps1` from the repo root (requires Python 3.11+ and pip only).
 - **Type check:** `mypy src` (or `make type`; with uv: `uv run mypy src`)
 - **Tests:** `PYTHONPATH=src pytest` (or `make test`; with uv: `uv run pytest`)
 

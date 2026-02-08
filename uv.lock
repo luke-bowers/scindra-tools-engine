@@ -806,7 +806,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },
-    { name = "twine", marker = "extra == 'dev'", specifier = ">=5.0" },
+    { name = "twine", marker = "extra == 'dev'", specifier = ">=6.2" },
     { name = "typer", specifier = ">=0.9" },
 ]
 provides-extras = ["dev"]
