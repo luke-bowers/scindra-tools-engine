@@ -25,7 +25,8 @@ Write-Host "==> Create temp venv and install wheel"
 $SmokeVenv = Join-Path $Root ".smoke_venv"
 if (Test-Path $SmokeVenv) { Remove-Item -Recurse -Force $SmokeVenv }
 uv venv $SmokeVenv --python 3.11
-& (Join-Path $SmokeVenv "Scripts" "Activate.ps1")
+$ActivateScript = Join-Path (Join-Path $SmokeVenv "Scripts") "Activate.ps1"
+& $ActivateScript
 pip install -q --upgrade pip
 $Wheel = Get-ChildItem -Path (Join-Path $Root "dist") -Filter "scindra_engine-*.whl" | Select-Object -First 1
 if (-not $Wheel) { throw "No wheel found in dist/" }

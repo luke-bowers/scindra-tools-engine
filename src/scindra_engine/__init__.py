@@ -11,7 +11,7 @@ def _get_version() -> str:
     if pyproject.exists():
         with open(pyproject, "rb") as f:
             data = tomllib.load(f)
-        return data["project"]["version"]
+        return str(data["project"]["version"])
     return "0.0.0+unknown"
 
 

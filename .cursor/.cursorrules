@@ -133,6 +133,19 @@ FILE + OUTPUT CONVENTIONS
   - warnings list.
 
 ========================
+RELEASE SMOKE GATE (MANDATORY BEFORE COMPLETING)
+========================
+Before you present a solution or say a build is complete:
+
+- Always run the release smoke script for this repo:
+  - Windows: `./scripts/smoke_release_local.ps1` (or `scripts\smoke_release_local.ps1`)
+  - macOS/Linux: `./scripts/smoke_release_local.sh`
+- If any step fails (lint, type check, tests, build, twine check, or wheel install + `scindra-engine --version`):
+  - Fix the underlying issues (e.g. mypy errors, test failures, missing deps).
+  - Re-run the smoke script until it passes.
+- Do not tell the user the assigned build is complete until the smoke script succeeds.
+
+========================
 CODE REVIEW CHECKLIST (APPLY BEFORE FINAL OUTPUT)
 ========================
 Before you finish any task:
@@ -145,6 +158,7 @@ Before you finish any task:
   - Are public functions documented (docstring for non-trivial ones)?
   - Does the change avoid new dependencies?
   - Do errors remain actionable?
+  - Has the release smoke script been run and passed? (see RELEASE SMOKE GATE above)
 
 ========================
 WHEN EDITING EXISTING CODE
