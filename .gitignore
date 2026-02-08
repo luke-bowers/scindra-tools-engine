@@ -2,6 +2,7 @@
 .venv/
 venv/
 env/
+.smoke_venv/
 
 # uv
 .uv/
