@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "scindra-engine"
+version = "0.1.0"
+description = "Scindra tools engine"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.9",
+    "pydantic>=2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.4",
+    "mypy>=1.8",
+    "pytest>=7",
+]
+
+[project.scripts]
+scindra-engine = "scindra_engine.__main__:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scindra_engine"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
