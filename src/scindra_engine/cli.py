@@ -11,8 +11,9 @@ from scindra_engine import __version__
 from pydantic import ValidationError
 
 from scindra_engine.hash_utils import file_bytes, sha256_file
-from scindra_engine.schemas import AnalysisConfig
+from scindra_engine.schemas import AnalysisConfig, TrackCentroidConfig
 from scindra_engine.video_io import FrameSampler, VideoIOError, VideoReader
+from scindra_engine.runners.track_centroid import run_track_centroid
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -198,9 +199,38 @@ def validate_config(
     except ValueError as e:
         typer.echo(f"Config invalid: {e}", err=True)
         raise typer.Exit(code=1)
+
+
+@app.command("track-centroid")
+def track_centroid(
+    video: Path = typer.Option(..., "--video", exists=True, file_okay=True, dir_okay=False, readable=True, help="Input video path"),
+    out_dir: Path = typer.Option(..., "--out", file_okay=False, help="Output directory"),
+    config_path: Path | None = typer.Option(None, "--config", exists=True, file_okay=True, dir_okay=False, readable=True, help="Optional JSON or YAML config"),
+) -> None:
+    """Track a centroid using the classical backend."""
+    try:
+        if config_path:
+            data = _load_config(config_path)
+            config = TrackCentroidConfig.model_validate(data)
+        else:
+            config = TrackCentroidConfig.model_validate({})
+
+        def progress_callback(done: int, total: int) -> None:
+            if total > 0:
+                typer.echo(f"PROGRESS {done}/{total}")
+
+        run_track_centroid(
+            video_path=video,
+            out_dir=out_dir,
+            config=config,
+            progress_callback=progress_callback,
+        )
+    except (FileNotFoundError, VideoIOError, OSError) as e:
+        typer.echo(f"Error: could not open video '{video}': {e}", err=True)
+        raise typer.Exit(code=1)
     except ValidationError as e:
         typer.echo(f"Config invalid: {e}", err=True)
         raise typer.Exit(code=1)
     except Exception as e:
-        typer.echo(f"Config invalid: {e}", err=True)
+        typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(code=1)
