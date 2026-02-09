@@ -159,6 +159,7 @@ Before you finish any task:
   - Does the change avoid new dependencies?
   - Do errors remain actionable?
   - Has the release smoke script been run and passed? (see RELEASE SMOKE GATE above)
+  - For any new smoke tests, scripts, or validation gates (e.g., schema checks, manifest checks), have the CI workflows under `.github/workflows/` been reviewed and updated so the new checks run in CI where appropriate?
 
 ========================
 WHEN EDITING EXISTING CODE
@@ -178,4 +179,4 @@ When you implement changes:
 - Provide a brief summary of what changed.
 - Provide file paths and full code for new files.
 - For modified files, show only changed sections unless asked for full file.
-- Call out any new scripts/commands required to run tests or lint.
+- Call out any new scripts/commands required to run tests or lint, and note whether CI workflows were updated to invoke them.

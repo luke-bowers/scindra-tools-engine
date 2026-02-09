@@ -1,0 +1,496 @@
+{
+  "$defs": {
+    "ArenaDetectionConfig": {
+      "properties": {
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "manual_arena_kind": {
+          "anyOf": [
+            {
+              "enum": [
+                "RECT",
+                "CIRCLE",
+                "ANNULUS",
+                "PLUS",
+                "Y",
+                "T",
+                "RADIAL",
+                "COMPARTMENTS"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Manual Arena Kind"
+        },
+        "manual_params": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Manual Params"
+        },
+        "min_confidence_to_auto_accept": {
+          "default": 0.85,
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Min Confidence To Auto Accept",
+          "type": "number"
+        },
+        "mode": {
+          "default": "AUTO",
+          "enum": [
+            "AUTO",
+            "MANUAL"
+          ],
+          "title": "Mode",
+          "type": "string"
+        }
+      },
+      "title": "ArenaDetectionConfig",
+      "type": "object"
+    },
+    "AssayConfig": {
+      "properties": {
+        "assay_type": {
+          "anyOf": [
+            {
+              "enum": [
+                "OPEN_FIELD",
+                "LIGHT_DARK_BOX",
+                "EPM",
+                "EZM",
+                "Y_MAZE",
+                "T_MAZE",
+                "BARNES_MAZE",
+                "MORRIS_WATER_MAZE",
+                "NOVEL_OBJECT_RECOGNITION",
+                "CONDITIONED_PLACE_PREFERENCE",
+                "THREE_CHAMBER_SOCIAL",
+                "HOME_CAGE_LOCOMOTION"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Assay Type"
+        },
+        "min_confidence_to_auto_accept": {
+          "default": 0.85,
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Min Confidence To Auto Accept",
+          "type": "number"
+        },
+        "selection_mode": {
+          "default": "AUTO",
+          "enum": [
+            "AUTO",
+            "MANUAL"
+          ],
+          "title": "Selection Mode",
+          "type": "string"
+        }
+      },
+      "title": "AssayConfig",
+      "type": "object"
+    },
+    "MetadataConfig": {
+      "properties": {
+        "lab": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lab"
+        },
+        "notes": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Notes"
+        },
+        "operator": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Operator"
+        }
+      },
+      "title": "MetadataConfig",
+      "type": "object"
+    },
+    "MorphologyConfig": {
+      "properties": {
+        "close_ksize": {
+          "default": 3,
+          "title": "Close Ksize",
+          "type": "integer"
+        },
+        "dilate_iters": {
+          "default": 0,
+          "title": "Dilate Iters",
+          "type": "integer"
+        },
+        "erode_iters": {
+          "default": 0,
+          "title": "Erode Iters",
+          "type": "integer"
+        },
+        "open_ksize": {
+          "default": 3,
+          "title": "Open Ksize",
+          "type": "integer"
+        }
+      },
+      "title": "MorphologyConfig",
+      "type": "object"
+    },
+    "OutputsConfig": {
+      "properties": {
+        "debug_frame_count": {
+          "default": 10,
+          "maximum": 50,
+          "minimum": 1,
+          "title": "Debug Frame Count",
+          "type": "integer"
+        },
+        "out_dir": {
+          "title": "Out Dir",
+          "type": "string"
+        },
+        "write_debug_frames": {
+          "default": true,
+          "title": "Write Debug Frames",
+          "type": "boolean"
+        },
+        "write_overlay_video": {
+          "default": true,
+          "title": "Write Overlay Video",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "out_dir"
+      ],
+      "title": "OutputsConfig",
+      "type": "object"
+    },
+    "PreprocessingConfig": {
+      "properties": {
+        "background_model": {
+          "default": "median_n",
+          "enum": [
+            "none",
+            "median_n"
+          ],
+          "title": "Background Model",
+          "type": "string"
+        },
+        "background_n": {
+          "default": 25,
+          "title": "Background N",
+          "type": "integer"
+        },
+        "clahe": {
+          "default": false,
+          "title": "Clahe",
+          "type": "boolean"
+        },
+        "clahe_clip_limit": {
+          "default": 2.0,
+          "title": "Clahe Clip Limit",
+          "type": "number"
+        },
+        "denoise": {
+          "default": "none",
+          "enum": [
+            "none",
+            "gaussian",
+            "bilateral"
+          ],
+          "title": "Denoise",
+          "type": "string"
+        },
+        "gamma": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Gamma"
+        },
+        "grayscale": {
+          "default": true,
+          "title": "Grayscale",
+          "type": "boolean"
+        },
+        "illumination_correction": {
+          "default": "none",
+          "enum": [
+            "none",
+            "rolling_ball",
+            "morph_open"
+          ],
+          "title": "Illumination Correction",
+          "type": "string"
+        }
+      },
+      "title": "PreprocessingConfig",
+      "type": "object"
+    },
+    "QCConfig": {
+      "properties": {
+        "max_jump_rate": {
+          "default": 0.1,
+          "title": "Max Jump Rate",
+          "type": "number"
+        },
+        "min_mean_confidence": {
+          "default": 0.7,
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Min Mean Confidence",
+          "type": "number"
+        },
+        "min_track_coverage": {
+          "default": 0.8,
+          "title": "Min Track Coverage",
+          "type": "number"
+        }
+      },
+      "title": "QCConfig",
+      "type": "object"
+    },
+    "SegmentationConfig": {
+      "properties": {
+        "adaptive_C": {
+          "default": 2,
+          "title": "Adaptive C",
+          "type": "integer"
+        },
+        "adaptive_block_size": {
+          "default": 35,
+          "title": "Adaptive Block Size",
+          "type": "integer"
+        },
+        "invert": {
+          "default": false,
+          "title": "Invert",
+          "type": "boolean"
+        },
+        "manual_value": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Manual Value"
+        },
+        "threshold": {
+          "default": "otsu",
+          "enum": [
+            "otsu",
+            "adaptive",
+            "manual"
+          ],
+          "title": "Threshold",
+          "type": "string"
+        }
+      },
+      "title": "SegmentationConfig",
+      "type": "object"
+    },
+    "TrackingConfig": {
+      "properties": {
+        "ema_alpha": {
+          "default": 0.3,
+          "title": "Ema Alpha",
+          "type": "number"
+        },
+        "max_area_px": {
+          "default": 100000,
+          "title": "Max Area Px",
+          "type": "integer"
+        },
+        "max_jump_px": {
+          "default": 80.0,
+          "title": "Max Jump Px",
+          "type": "number"
+        },
+        "min_area_px": {
+          "default": 50,
+          "title": "Min Area Px",
+          "type": "integer"
+        },
+        "smoothing": {
+          "default": "none",
+          "enum": [
+            "none",
+            "ema"
+          ],
+          "title": "Smoothing",
+          "type": "string"
+        }
+      },
+      "title": "TrackingConfig",
+      "type": "object"
+    },
+    "VideoConfig": {
+      "properties": {
+        "end_time_s": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "End Time S"
+        },
+        "fps_override": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Fps Override"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "start_time_s": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Start Time S"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "title": "VideoConfig",
+      "type": "object"
+    },
+    "ZonesConfig": {
+      "properties": {
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "mode": {
+          "default": "AUTO_TEMPLATE",
+          "enum": [
+            "AUTO_TEMPLATE",
+            "MANUAL"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "template_params": {
+          "additionalProperties": true,
+          "title": "Template Params",
+          "type": "object"
+        }
+      },
+      "title": "ZonesConfig",
+      "type": "object"
+    }
+  },
+  "properties": {
+    "arena_detection": {
+      "$ref": "#/$defs/ArenaDetectionConfig"
+    },
+    "assay": {
+      "$ref": "#/$defs/AssayConfig"
+    },
+    "metadata": {
+      "$ref": "#/$defs/MetadataConfig"
+    },
+    "morphology": {
+      "$ref": "#/$defs/MorphologyConfig"
+    },
+    "outputs": {
+      "$ref": "#/$defs/OutputsConfig"
+    },
+    "preprocessing": {
+      "$ref": "#/$defs/PreprocessingConfig"
+    },
+    "qc": {
+      "$ref": "#/$defs/QCConfig"
+    },
+    "segmentation": {
+      "$ref": "#/$defs/SegmentationConfig"
+    },
+    "tracking": {
+      "$ref": "#/$defs/TrackingConfig"
+    },
+    "video": {
+      "$ref": "#/$defs/VideoConfig"
+    },
+    "zones": {
+      "$ref": "#/$defs/ZonesConfig"
+    }
+  },
+  "required": [
+    "assay",
+    "video",
+    "outputs"
+  ],
+  "title": "AnalysisConfig",
+  "type": "object"
+}

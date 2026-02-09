@@ -1,0 +1,202 @@
+{
+  "$defs": {
+    "ConfigFile": {
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "title": "ConfigFile",
+      "type": "object"
+    },
+    "InputFile": {
+      "properties": {
+        "bytes": {
+          "title": "Bytes",
+          "type": "integer"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "bytes"
+      ],
+      "title": "InputFile",
+      "type": "object"
+    },
+    "OutputFile": {
+      "properties": {
+        "bytes": {
+          "title": "Bytes",
+          "type": "integer"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "path",
+        "sha256",
+        "bytes"
+      ],
+      "title": "OutputFile",
+      "type": "object"
+    }
+  },
+  "properties": {
+    "confidence": {
+      "additionalProperties": {
+        "type": "number"
+      },
+      "title": "Confidence",
+      "type": "object"
+    },
+    "config": {
+      "$ref": "#/$defs/ConfigFile"
+    },
+    "engine_version": {
+      "title": "Engine Version",
+      "type": "string"
+    },
+    "finished_at": {
+      "title": "Finished At",
+      "type": "string"
+    },
+    "git_commit": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Git Commit"
+    },
+    "input_files": {
+      "items": {
+        "$ref": "#/$defs/InputFile"
+      },
+      "title": "Input Files",
+      "type": "array"
+    },
+    "needs_review": {
+      "title": "Needs Review",
+      "type": "boolean"
+    },
+    "outputs": {
+      "items": {
+        "$ref": "#/$defs/OutputFile"
+      },
+      "title": "Outputs",
+      "type": "array"
+    },
+    "qc_metrics": {
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "integer"
+          },
+          {
+            "type": "string"
+          },
+          {
+            "type": "boolean"
+          }
+        ]
+      },
+      "title": "Qc Metrics",
+      "type": "object"
+    },
+    "review_reasons": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Review Reasons",
+      "type": "array"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "started_at": {
+      "title": "Started At",
+      "type": "string"
+    },
+    "summary_metrics": {
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "integer"
+          },
+          {
+            "type": "string"
+          },
+          {
+            "type": "boolean"
+          }
+        ]
+      },
+      "title": "Summary Metrics",
+      "type": "object"
+    },
+    "warnings": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Warnings",
+      "type": "array"
+    }
+  },
+  "required": [
+    "engine_version",
+    "run_id",
+    "started_at",
+    "finished_at",
+    "input_files",
+    "config",
+    "outputs",
+    "qc_metrics",
+    "summary_metrics",
+    "warnings",
+    "needs_review",
+    "review_reasons",
+    "confidence"
+  ],
+  "title": "ArtifactManifest",
+  "type": "object"
+}

@@ -33,6 +33,12 @@ jobs:
         env:
           PYTHONPATH: src
 
+      - name: Generate schemas
+        run: uv run python scripts/generate_schemas.py
+
+      - name: Check schema drift
+        run: uv run python scripts/check_schemas_up_to_date.py
+
       - name: Verify package version matches tag
         run: uv run python scripts/check_release_version.py ${{ github.ref_name }}
 
