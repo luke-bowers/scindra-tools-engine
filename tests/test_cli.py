@@ -62,6 +62,7 @@ def test_validate_config_invalid() -> None:
     try:
         result = runner.invoke(app, ["validate-config", "--config", str(config_path)])
         assert result.exit_code == 1
-        assert "invalid" in result.stdout.lower()
+        # Error messages go to stderr
+        assert "invalid" in (result.stdout + result.stderr).lower()
     finally:
         config_path.unlink()

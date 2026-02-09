@@ -1,0 +1,205 @@
+# .cursorrules — scindra-tools-engine (Python OSS)
+
+# Goal: clean, functional, modern Python (3.11+) with reproducible analysis outputs.
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                    ⚠️  CRITICAL: MANDATORY COMPLETION CHECK  ⚠️              ║
+║                                                                              ║
+║  BEFORE MARKING ANY TASK AS COMPLETE OR SAYING "DONE":                      ║
+║                                                                              ║
+║  1. Run the release smoke script:                                            ║
+║     Windows:  .\scripts\smoke_release_local.ps1                             ║
+║     Linux/Mac: ./scripts/smoke_release_local.sh                             ║
+║                                                                              ║
+║  2. Verify ALL steps pass: lint, type check, tests, build, twine, install   ║
+║                                                                              ║
+║  3. Fix any failures and re-run until the script succeeds                   ║
+║                                                                              ║
+║  4. ONLY THEN mark tasks as complete                                         ║
+║                                                                              ║
+║  See "RELEASE SMOKE GATE" section below for full details.                   ║
+║  See .cursor/PRE_COMPLETION_CHECKLIST.md for the full checklist.             ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+You are an expert Python engineer working in a scientific tooling codebase.
+Priorities (in order): correctness > reproducibility/determinism > clarity > testability > performance.
+
+========================
+PROJECT PRINCIPLES
+========================
+
+- Keep the engine "boring": small, composable functions; minimal hidden state.
+- Determinism is a feature:
+  - No random behavior unless explicitly configured with a seed and recorded in artifacts.
+  - Any run must be re-runnable given the same inputs + config.
+- Clean-room: do not copy/paste from GPL projects or unknown-license sources.
+- Prefer explicitness:
+  - Avoid "magic" implicit behavior.
+  - Prefer explicit config + explicit outputs.
+
+========================
+LANGUAGE + STYLE
+========================
+
+- Target Python: 3.11+.
+- Write modern, typed Python:
+  - Use `from __future__ import annotations` in new modules.
+  - Use `pathlib.Path`, `typing` / `collections.abc` types.
+  - Prefer `typing.NamedTuple` / `dataclass(frozen=True)` for lightweight immutable records
+    unless Pydantic models are needed.
+- Functional style:
+  - Prefer pure functions (input -> output) with no side effects.
+  - Separate computation from IO (read/write files only in dedicated modules).
+- Keep modules cohesive:
+  - video_io.py: reading/writing video
+  - preprocess.py: image transforms
+  - segmentation.py: thresholding/masks/candidates
+  - tracking.py: selection + smoothing
+  - qc.py: metrics + warnings
+  - metrics.py: assay metrics
+  - artifacts.py: writing outputs + manifest
+  - cli.py: Typer CLI
+- Avoid unnecessary abstractions:
+  - Only introduce classes if they add real value (e.g., VideoReader, EngineRunner).
+  - No over-engineered inheritance, factories, or heavy patterns.
+
+========================
+DEPENDENCIES
+========================
+
+- Keep dependencies minimal and mainstream.
+- Allowed core deps: numpy, opencv-python (or headless), scipy, scikit-image, pydantic, typer, matplotlib, pytest.
+- Do NOT add new dependencies without a strong reason. If you must, explain:
+  - what it replaces
+  - why standard lib is insufficient
+  - how it affects packaging (wheels) and platform support.
+- When adding or using a third-party package in code or tests (e.g. `jsonschema` in `tests/test_schemas.py`):
+  - Ensure it is declared in `pyproject.toml` (in `dependencies` or the appropriate optional extra like `dev`).
+  - Run `uv sync --extra dev` locally to update `uv.lock` so CI (which uses `uv sync --extra dev --frozen`) sees the new dependency.
+  - Commit the updated `uv.lock` along with the code change to avoid CI failures due to missing packages.
+
+========================
+TYPES + VALIDATION
+========================
+
+- Every public function must have type hints.
+- Use Pydantic (v2) for user-facing configs and artifact manifests.
+- Validate early:
+  - validate config once at boundary (CLI / API entry)
+  - internal functions assume validated inputs.
+- Prefer returning structured types over dicts.
+- Never silently swallow errors. Raise typed exceptions.
+
+========================
+ERROR HANDLING
+========================
+
+- Define narrow custom exceptions where it improves clarity:
+  - e.g., ConfigError, VideoDecodeError, ArenaDetectionError
+- Include actionable error messages.
+- If recovery is possible, return (result, warnings) or attach warnings in manifest; do not hide failures.
+
+========================
+LOGGING
+========================
+
+- Use stdlib `logging` (no fancy logging frameworks).
+- Logs must be useful in batch runs:
+  - include run_id in log lines when possible
+  - avoid noisy per-frame logs unless debug mode.
+- For progress, print stable machine-parsable markers:
+  - `PROGRESS <frame>/<total>` at configurable intervals.
+
+========================
+TESTING RULES (PYTEST)
+========================
+
+- Add/modify tests for every behavior change.
+- Tests must be deterministic and fast:
+  - prefer synthetic frames/videos over large real assets
+  - avoid network and external services
+  - avoid timing-dependent assertions.
+- Use fixtures for repeated setup.
+- Validate "golden" outputs:
+  - schema round-trips
+  - manifest fields exist and match expected structure
+  - qc warnings fire in known scenarios.
+
+========================
+PERFORMANCE
+========================
+
+- Optimize last.
+- If a loop is slow:
+  - reduce allocations
+  - use vectorized numpy where simple
+  - keep OpenCV operations in OpenCV (avoid Python loops) when possible.
+- Any optimization must preserve determinism and correctness.
+
+========================
+FILE + OUTPUT CONVENTIONS
+========================
+
+- All outputs go under out*dir/run*<run_id>/.
+- Always write:
+  - resolved config (config.used.yaml/json)
+  - per_frame.csv
+  - qc.json
+  - summary.json
+  - manifest.json (with sha256 + sizes)
+- Manifest must include:
+  - engine_version
+  - git_commit (if available)
+  - input file hashes
+  - config hash
+  - output hashes
+  - warnings list.
+
+========================
+RELEASE SMOKE GATE (MANDATORY BEFORE COMPLETING)
+========================
+Before you present a solution or say a build is complete:
+
+- Always run the release smoke script for this repo:
+  - Windows: `./scripts/smoke_release_local.ps1` (or `scripts\smoke_release_local.ps1`)
+  - macOS/Linux: `./scripts/smoke_release_local.sh`
+- If any step fails (lint, type check, tests, build, twine check, or wheel install + `scindra-engine --version`):
+  - Fix the underlying issues (e.g. mypy errors, test failures, missing deps).
+  - Re-run the smoke script until it passes.
+- Do not tell the user the assigned build is complete until the smoke script succeeds.
+
+========================
+CODE REVIEW CHECKLIST (APPLY BEFORE FINAL OUTPUT)
+========================
+Before you finish any task:
+
+- Run through:
+  - Is the change deterministic?
+  - Are side effects contained to IO modules?
+  - Are types accurate and mypy-friendly?
+  - Are tests added/updated and not flaky?
+  - Are public functions documented (docstring for non-trivial ones)?
+  - Does the change avoid new dependencies?
+  - Do errors remain actionable?
+  - Has the release smoke script been run and passed? (see RELEASE SMOKE GATE above)
+  - For any new smoke tests, scripts, or validation gates (e.g., schema checks, manifest checks), have the CI workflows under `.github/workflows/` been reviewed and updated so the new checks run in CI where appropriate?
+
+========================
+WHEN EDITING EXISTING CODE
+========================
+
+- Preserve existing public APIs unless explicitly asked to break them.
+- Keep diffs small and readable.
+- If refactoring, do it in a separate commit-sized change:
+  - first add tests
+  - then refactor while keeping behavior stable.
+
+========================
+OUTPUT FORMAT FOR CURSOR
+========================
+When you implement changes:
+
+- Provide a brief summary of what changed.
+- Provide file paths and full code for new files.
+- For modified files, show only changed sections unless asked for full file.
+- Call out any new scripts/commands required to run tests or lint, and note whether CI workflows were updated to invoke them.

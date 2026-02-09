@@ -52,7 +52,7 @@ def engine_info(json_output: bool = typer.Option(False, "--json", help="Emit mac
         }
 
         try:
-            import cv2  # type: ignore[import-untyped]
+            import cv2
 
             info["opencv_version"] = cv2.__version__
         except ImportError:
@@ -71,7 +71,7 @@ def engine_info(json_output: bool = typer.Option(False, "--json", help="Emit mac
 
 @app.command("probe")
 def probe(
-    video: Path = typer.Option(..., "--video", path_type=Path, exists=True, file_okay=True, dir_okay=False, readable=True, help="Input video path"),
+    video: Path = typer.Option(..., "--video", exists=True, file_okay=True, dir_okay=False, readable=True, help="Input video path"),
     json_output: bool = typer.Option(False, "--json", help="Emit JSON probe result"),
 ) -> None:
     """Probe video file and output metadata."""
@@ -111,13 +111,13 @@ def probe(
 
 @app.command("extract-frames")
 def extract_frames(
-    video: Path = typer.Option(..., "--video", path_type=Path, exists=True, file_okay=True, dir_okay=False, readable=True, help="Input video path"),
-    out_dir: Path = typer.Option(..., "--out", path_type=Path, file_okay=False, help="Directory to write PNG frames"),
+    video: Path = typer.Option(..., "--video", exists=True, file_okay=True, dir_okay=False, readable=True, help="Input video path"),
+    out_dir: Path = typer.Option(..., "--out", file_okay=False, help="Directory to write PNG frames"),
     count: int = typer.Option(10, "--count", min=1, help="Number of frames to sample"),
 ) -> None:
     """Extract evenly sampled frames from a video as PNG files."""
     try:
-        import cv2  # type: ignore[import-untyped]
+        import cv2
 
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -150,10 +150,14 @@ def extract_frames(
 def _load_config(config_path: Path) -> dict[str, object]:
     """Load a JSON or YAML config file and return a dict."""
     suffix = config_path.suffix.lower()
+    data: dict[str, object]
 
     if suffix == ".json":
         try:
-            data = json.loads(config_path.read_text(encoding="utf-8"))
+            loaded = json.loads(config_path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                raise ValueError("JSON file must contain an object at the top level")
+            data = loaded
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON: {e}") from e
     elif suffix in (".yaml", ".yml"):
@@ -164,21 +168,23 @@ def _load_config(config_path: Path) -> dict[str, object]:
             raise typer.Exit(code=1)
 
         try:
-            data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-        except yaml.YAMLError as e:  # type: ignore[name-defined]
+            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            if loaded is None:
+                raise ValueError("YAML file is empty or contains only null")
+            if not isinstance(loaded, dict):
+                raise ValueError("YAML file must contain a mapping at the top level")
+            data = loaded
+        except yaml.YAMLError as e:
             raise ValueError(f"Invalid YAML: {e}") from e
     else:
         raise ValueError(f"Unsupported config format: {suffix}. Only .json, .yaml, and .yml are supported.")
-
-    if data is None or not isinstance(data, dict):
-        raise ValueError("Config file must contain a JSON object or YAML mapping at the top level.")
 
     return data
 
 
 @app.command("validate-config")
 def validate_config(
-    config_path: Path = typer.Option(..., "--config", path_type=Path, exists=True, file_okay=True, dir_okay=False, readable=True, help="JSON or YAML analysis config file"),
+    config_path: Path = typer.Option(..., "--config", exists=True, file_okay=True, dir_okay=False, readable=True, help="JSON or YAML analysis config file"),
 ) -> None:
     """Validate an analysis configuration file."""
     try:
