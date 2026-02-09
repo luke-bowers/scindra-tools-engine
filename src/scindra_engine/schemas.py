@@ -139,6 +139,20 @@ class QCConfig(BaseModel):
     min_mean_confidence: float = Field(default=0.7, ge=0.0, le=1.0)
 
 
+class TrackCentroidConfig(BaseModel):
+    preprocessing: PreprocessingConfig = Field(
+        default_factory=PreprocessingConfig
+    )
+    segmentation: SegmentationConfig = Field(
+        default_factory=lambda: SegmentationConfig(invert=True)
+    )
+    morphology: MorphologyConfig = Field(default_factory=MorphologyConfig)
+    tracking: TrackingConfig = Field(default_factory=TrackingConfig)
+    progress_interval: int = Field(default=50, ge=1)
+    ambiguity_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
+    shadow_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
+
+
 class OutputsConfig(BaseModel):
     out_dir: str
     write_overlay_video: bool = True
