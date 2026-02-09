@@ -19,3 +19,8 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 *.pyc
+
+# Test outputs and artifacts
+out/
+test_config.json
+invalid_config.json
