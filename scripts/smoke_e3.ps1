@@ -1,6 +1,7 @@
 # E2E smoke test for E3: schemas, validation, and schema generation.
 # Run from repo root. Requires Python 3.11+.
 $ErrorActionPreference = "Stop"
+$PSNativeCommandUseErrorActionPreference = $true
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = Resolve-Path (Join-Path $ScriptDir "..")

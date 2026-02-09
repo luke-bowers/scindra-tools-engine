@@ -1,0 +1,17 @@
+---
+description: Ensure PowerShell smoke scripts fail on native command errors
+alwaysApply: true
+---
+
+# PowerShell smoke scripts and native command failures
+
+- In any PowerShell smoke / CI script (for example under `scripts/*.ps1`), always configure error handling so that failures in native commands (like `python.exe`) stop the script.
+- At the top of each such script, **set both**:
+
+```powershell
+$ErrorActionPreference = "Stop"
+$PSNativeCommandUseErrorActionPreference = $true
+```
+
+- This ensures that issues like `ModuleNotFoundError` from `python` (or other non-zero exits from native tools) cause the script to fail immediately instead of continuing on to print a misleading success message such as `Smoke E3: OK` or `Smoke E4: OK`.
+

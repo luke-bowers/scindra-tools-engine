@@ -54,6 +54,10 @@ DEPENDENCIES
   - what it replaces
   - why standard lib is insufficient
   - how it affects packaging (wheels) and platform support.
+- When adding or using a third-party package in code or tests (e.g. `jsonschema` in `tests/test_schemas.py`):
+  - Ensure it is declared in `pyproject.toml` (in `dependencies` or the appropriate optional extra like `dev`).
+  - Run `uv sync --extra dev` locally to update `uv.lock` so CI (which uses `uv sync --extra dev --frozen`) sees the new dependency.
+  - Commit the updated `uv.lock` along with the code change to avoid CI failures due to missing packages.
 
 ========================
 TYPES + VALIDATION
