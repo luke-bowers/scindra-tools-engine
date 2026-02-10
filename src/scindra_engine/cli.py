@@ -206,6 +206,22 @@ def track_centroid(
     video: Path = typer.Option(..., "--video", exists=True, file_okay=True, dir_okay=False, readable=True, help="Input video path"),
     out_dir: Path = typer.Option(..., "--out", file_okay=False, help="Output directory"),
     config_path: Path | None = typer.Option(None, "--config", exists=True, file_okay=True, dir_okay=False, readable=True, help="Optional JSON or YAML config"),
+    overlay: bool = typer.Option(
+        True,
+        "--overlay/--no-overlay",
+        help="Enable or disable overlay video output (default: on)",
+    ),
+    heatmap: bool = typer.Option(
+        True,
+        "--heatmap/--no-heatmap",
+        help="Enable or disable heatmap PNG output (default: on)",
+    ),
+    trail_length: int = typer.Option(
+        30,
+        "--trail-length",
+        min=1,
+        help="Number of recent centroids to include in the overlay trail",
+    ),
 ) -> None:
     """Track a centroid using the classical backend."""
     try:
@@ -224,6 +240,9 @@ def track_centroid(
             out_dir=out_dir,
             config=config,
             progress_callback=progress_callback,
+            write_overlay_video=overlay,
+            write_heatmap=heatmap,
+            trail_length=trail_length,
         )
     except (FileNotFoundError, VideoIOError, OSError) as e:
         typer.echo(f"Error: could not open video '{video}': {e}", err=True)

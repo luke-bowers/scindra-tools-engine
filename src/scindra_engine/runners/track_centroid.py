@@ -15,6 +15,7 @@ from scindra_engine.schemas import TrackCentroidConfig
 from scindra_engine.segmentation import segment_frame
 from scindra_engine.tracking import TrackPoint, track_frame
 from scindra_engine.video_io import FrameSampler, VideoReader
+from scindra_engine.visualize import write_heatmap_png, write_overlay_video as _write_overlay_video
 
 
 @dataclass(frozen=True)
@@ -29,14 +30,23 @@ def run_track_centroid(
     out_dir: Path,
     config: TrackCentroidConfig,
     progress_callback: Callable[[int, int], None] | None = None,
+    *,
+    write_overlay_video: bool | None = None,
+    write_heatmap: bool | None = None,
+    trail_length: int | None = None,
 ) -> TrackCentroidResult:
     run_id = _make_run_id()
     run_dir = out_dir / f"run_{run_id}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    width = 0
+    height = 0
+
     with VideoReader(video_path) as reader:
         background = _build_background(reader, config)
         points = _track_video(reader, config, background, progress_callback)
+        width = reader.width
+        height = reader.height
 
     per_frame_path = run_dir / "per_frame.csv"
     _write_per_frame(per_frame_path, points)
@@ -44,6 +54,35 @@ def run_track_centroid(
     summary = _summarize(points, config)
     summary_path = run_dir / "tracking_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    overlay_enabled, heatmap_enabled, effective_trail_length = (
+        _resolve_visualization_options(
+            config=config,
+            write_overlay_video_override=write_overlay_video,
+            write_heatmap_override=write_heatmap,
+            trail_length_override=trail_length,
+        )
+    )
+
+    if overlay_enabled:
+        overlay_path = run_dir / "overlay.mp4"
+        _write_overlay_video(
+            str(video_path),
+            points,
+            str(overlay_path),
+            trail_length=effective_trail_length,
+        )
+
+    if heatmap_enabled:
+        if width <= 0 or height <= 0:
+            raise RuntimeError("Video dimensions are not available for heatmap output")
+        heatmap_path = run_dir / "heatmap.png"
+        write_heatmap_png(
+            width=width,
+            height=height,
+            track_points=points,
+            out_path=str(heatmap_path),
+        )
 
     return TrackCentroidResult(run_dir=run_dir, points=points, summary=summary)
 
@@ -183,3 +222,41 @@ def _jump_rate(
             total += 1
         prev = point
     return (jumps / total) if total > 0 else 0.0
+
+
+def _resolve_visualization_options(
+    *,
+    config: TrackCentroidConfig,
+    write_overlay_video_override: bool | None,
+    write_heatmap_override: bool | None,
+    trail_length_override: int | None,
+) -> tuple[bool, bool, int]:
+    """Resolve overlay/heatmap settings from config and overrides.
+
+    Defaults are overlay and heatmap enabled, with a short trail. If the
+    config later gains an `outputs` section, its fields will be respected but
+    still overridden by explicit function arguments (e.g. CLI flags).
+    """
+    overlay_default = True
+    heatmap_default = True
+    trail_default = 30
+
+    outputs = getattr(config, "outputs", None)
+    if outputs is not None:
+        overlay_default = getattr(outputs, "write_overlay_video", overlay_default)
+        heatmap_default = getattr(outputs, "write_heatmap", heatmap_default)
+        trail_default = getattr(outputs, "trail_length", trail_default)
+
+    overlay_enabled = (
+        overlay_default if write_overlay_video_override is None else write_overlay_video_override
+    )
+    heatmap_enabled = (
+        heatmap_default if write_heatmap_override is None else write_heatmap_override
+    )
+
+    trail_value = trail_default if trail_length_override is None else trail_length_override
+    if trail_value <= 0:
+        trail_value = 1
+
+    return overlay_enabled, heatmap_enabled, trail_value
+
