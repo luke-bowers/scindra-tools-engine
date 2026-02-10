@@ -1,5 +1,5 @@
 # E2E smoke test for E5.1: CLI commands (engine-info, probe, extract-frames, validate-config).
-# Run from repo root. Requires Python 3.11+.
+# Run from repo root. Requires uv and Python 3.11+.
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $true
 
@@ -10,10 +10,10 @@ Set-Location $Root
 & (Join-Path $ScriptDir "smoke_e5.ps1")
 
 Write-Host "==> CLI engine-info test"
-python -m scindra_engine.cli engine-info --json
+uv run python -m scindra_engine.cli engine-info --json
 
 Write-Host "==> Generate synthetic video for CLI tests"
-$SynthVideo = python -c "
+$SynthVideo = uv run python -c "
 from pathlib import Path
 from tests.fixtures.synth_video import make_synth_video
 out_dir = Path('out/cli_smoke')
@@ -23,17 +23,17 @@ print(video)
 "
 
 Write-Host "==> CLI probe test"
-scindra-engine probe --video $SynthVideo --json
+uv run scindra-engine probe --video $SynthVideo --json
 
 Write-Host "==> CLI extract-frames test"
 $FramesDir = "out/cli_smoke/frames"
 if (Test-Path $FramesDir) {
     Remove-Item -Recurse -Force $FramesDir
 }
-scindra-engine extract-frames --video $SynthVideo --out $FramesDir --count 5
+uv run scindra-engine extract-frames --video $SynthVideo --out $FramesDir --count 5
 
 Write-Host "==> Verify 5 PNGs were written"
-python -c "
+uv run python -c "
 from pathlib import Path
 frames_dir = Path('out/cli_smoke/frames')
 frames = list(frames_dir.glob('*.png'))

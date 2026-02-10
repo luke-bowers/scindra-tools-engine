@@ -1,5 +1,5 @@
 # E2E smoke test for E6: track-centroid pipeline.
-# Run from repo root. Requires Python 3.11+.
+# Run from repo root. Requires uv and Python 3.11+.
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $true
 
@@ -10,7 +10,7 @@ Set-Location $Root
 & (Join-Path $ScriptDir "smoke_e5_1.ps1")
 
 Write-Host "==> Generate synthetic mouse+shadow video"
-$SynthVideo = python -c "
+$SynthVideo = uv run python -c "
 from pathlib import Path
 from tests.fixtures.synth_mouse_shadow import make_synth_mouse_shadow_video
 out_dir = Path('out/e6')
@@ -20,10 +20,10 @@ print(video)
 "
 
 Write-Host "==> Run track-centroid on synthetic video"
-scindra-engine track-centroid --video $SynthVideo --out out/e6
+uv run scindra-engine track-centroid --video $SynthVideo --out out/e6
 
 Write-Host "==> Validate per_frame.csv and coverage"
-python -c "
+uv run python -c "
 from pathlib import Path
 import csv
 
@@ -47,8 +47,8 @@ print('Synthetic tracking coverage OK:', coverage)
 
 if ($env:VIDEO_PATH) {
     Write-Host "==> Run track-centroid on real video"
-    scindra-engine track-centroid --video $env:VIDEO_PATH --out out/e6_real
-    python -c "
+    uv run scindra-engine track-centroid --video $env:VIDEO_PATH --out out/e6_real
+    uv run python -c "
 from pathlib import Path
 run_dirs = sorted(Path('out/e6_real').glob('run_*'), key=lambda p: p.stat().st_mtime)
 assert run_dirs, 'No run directories created for real video'
