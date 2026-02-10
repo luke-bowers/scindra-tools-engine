@@ -144,7 +144,9 @@ class TrackCentroidConfig(BaseModel):
         default_factory=PreprocessingConfig
     )
     segmentation: SegmentationConfig = Field(
-        default_factory=lambda: SegmentationConfig(invert=True)
+        # Background subtraction yields a bright foreground on dark background,
+        # so the default should keep foreground as white for connected components.
+        default_factory=lambda: SegmentationConfig(invert=False)
     )
     morphology: MorphologyConfig = Field(default_factory=MorphologyConfig)
     tracking: TrackingConfig = Field(default_factory=TrackingConfig)
