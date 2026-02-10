@@ -5,13 +5,6 @@ import argparse
 import sys
 from pathlib import Path
 
-# Allow importing tests.fixtures when run as scripts/generate_synth_mouse_video.py
-_repo_root = Path(__file__).resolve().parent.parent
-if str(_repo_root) not in sys.path:
-    sys.path.insert(0, str(_repo_root))
-
-from tests.fixtures.synth_mouse_shadow import write_synth_mouse_shadow_video
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -51,6 +44,13 @@ def main() -> None:
         help="Frames per second (default: 15.0)",
     )
     args = parser.parse_args()
+
+    # Allow importing tests.fixtures when run as scripts/generate_synth_mouse_video.py
+    repo_root = Path(__file__).resolve().parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    from tests.fixtures.synth_mouse_shadow import write_synth_mouse_shadow_video
 
     out = args.out
     if out.suffix.lower() != ".mp4":
