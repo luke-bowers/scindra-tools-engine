@@ -1,7 +1,21 @@
-.PHONY: lint type test
+.PHONY: setup lint type test build
+
+setup:
+	uv sync --extra dev --frozen
+
 lint:
-	ruff check .
+	uv run ruff check .
+
 type:
-	mypy src
+	uv run mypy src
+
+ifeq ($(OS),Windows_NT)
 test:
-	PYTHONPATH=src pytest
+	set PYTHONPATH=src && uv run pytest
+else
+test:
+	PYTHONPATH=src uv run pytest
+endif
+
+build:
+	uv run python -m build
