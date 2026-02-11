@@ -156,11 +156,29 @@ def _select_candidate(
 
     def score(candidate: Candidate) -> float:
         solidity_score = candidate.solidity
+        shadow_penalty = 0.35 if _is_shadow_like(candidate) else 0.0
+
         if previous is None or previous.x is None or previous.y is None:
-            return solidity_score
+            # Bootstrap: prefer compact, non-shadow-like shapes.
+            return solidity_score - shadow_penalty
+
         dist = _distance(candidate.centroid, (previous.x, previous.y))
         distance_score = max(0.0, 1.0 - dist / tracking.max_jump_px)
-        return 0.6 * solidity_score + 0.4 * distance_score
+
+        area_score = 1.0
+        if previous.area is not None and previous.area > 0:
+            ratio = candidate.area / previous.area
+            if ratio > 1.0:
+                ratio = 1.0 / ratio
+            area_score = max(0.0, min(1.0, float(ratio)))
+
+        # Bias toward consistent, compact motion and away from likely shadows.
+        return (
+            0.50 * distance_score
+            + 0.30 * solidity_score
+            + 0.20 * area_score
+            - shadow_penalty
+        )
 
     return max(candidates, key=score)
 
