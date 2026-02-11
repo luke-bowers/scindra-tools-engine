@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import time
 from pathlib import Path
 
 import typer
@@ -148,6 +149,27 @@ def extract_frames(
         raise typer.Exit(code=1)
 
 
+def _format_duration(seconds: float) -> str:
+    """Format duration in seconds to a human-readable string.
+    
+    Args:
+        seconds: Duration in seconds.
+        
+    Returns:
+        Formatted string like "1m 23s" or "45s" or "0.5s".
+    """
+    if seconds < 1.0:
+        return f"{seconds:.1f}s"
+    
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+    
+    if minutes > 0:
+        return f"{minutes}m {secs}s"
+    else:
+        return f"{secs}s"
+
+
 def _load_config(config_path: Path) -> dict[str, object]:
     """Load a JSON or YAML config file and return a dict."""
     suffix = config_path.suffix.lower()
@@ -222,6 +244,24 @@ def track_centroid(
         min=1,
         help="Number of recent centroids to include in the overlay trail",
     ),
+    workers: int | None = typer.Option(
+        None,
+        "--workers",
+        min=1,
+        help="Number of parallel workers for frame processing (default: auto, based on CPU count)",
+    ),
+    chunk_size: int | None = typer.Option(
+        None,
+        "--chunk-size",
+        min=1,
+        help="Number of frames per chunk for parallel processing (default: 200)",
+    ),
+    downsample_factor: float | None = typer.Option(
+        None,
+        "--downsample-factor",
+        min=1.0,
+        help="Downsample frames by this factor before processing (e.g., 2.0 = half resolution). Coordinates are scaled back to original resolution.",
+    ),
 ) -> None:
     """Track a centroid using the classical backend."""
     try:
@@ -230,10 +270,55 @@ def track_centroid(
             config = TrackCentroidConfig.model_validate(data)
         else:
             config = TrackCentroidConfig.model_validate({})
+        
+        # Override downsample_factor from CLI if provided
+        if downsample_factor is not None:
+            config.downsample_factor = downsample_factor
+
+        # Track start time for progress reporting
+        start_time = time.time()
 
         def progress_callback(done: int, total: int) -> None:
             if total > 0:
-                typer.echo(f"PROGRESS {done}/{total}")
+                current_time = time.time()
+                elapsed = current_time - start_time
+                
+                # Calculate percentage
+                percentage = (done / total) * 100
+                
+                # Calculate rate (frames per second)
+                if done > 0 and elapsed > 0:
+                    rate = done / elapsed
+                else:
+                    rate = 0.0
+                
+                # Estimate time remaining
+                if done > 0 and done < total:
+                    remaining_frames = total - done
+                    if rate > 0:
+                        eta_seconds = remaining_frames / rate
+                        eta_str = _format_duration(eta_seconds)
+                    else:
+                        eta_str = "?"
+                elif done >= total:
+                    eta_str = "0s"
+                else:
+                    eta_str = "?"
+                
+                elapsed_str = _format_duration(elapsed)
+                
+                # Format rate
+                if rate > 0:
+                    rate_str = f"{rate:.1f} fps"
+                else:
+                    rate_str = "0.0 fps"
+                
+                typer.echo(
+                    f"PROGRESS {done}/{total} ({percentage:.1f}%) | "
+                    f"Elapsed: {elapsed_str} | "
+                    f"Rate: {rate_str} | "
+                    f"ETA: {eta_str}"
+                )
 
         run_track_centroid(
             video_path=video,
@@ -243,6 +328,8 @@ def track_centroid(
             write_overlay_video=overlay,
             write_heatmap=heatmap,
             trail_length=trail_length,
+            parallel_workers=workers,
+            chunk_size=chunk_size,
         )
     except (FileNotFoundError, VideoIOError, OSError) as e:
         typer.echo(f"Error: could not open video '{video}': {e}", err=True)

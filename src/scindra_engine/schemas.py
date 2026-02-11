@@ -153,6 +153,9 @@ class TrackCentroidConfig(BaseModel):
     progress_interval: int = Field(default=50, ge=1)
     ambiguity_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
     shadow_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
+    parallel_workers: int | None = Field(default=None, ge=1, description="Number of parallel workers for frame processing (None = auto)")
+    chunk_size: int = Field(default=200, ge=1, description="Number of frames per chunk for parallel processing")
+    downsample_factor: float | None = Field(default=None, ge=1.0, description="Downsample frames by this factor before processing (e.g., 2.0 = half resolution). Coordinates are scaled back to original resolution.")
 
 
 class OutputsConfig(BaseModel):
