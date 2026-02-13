@@ -20,6 +20,38 @@ For development, the project uses [uv](https://docs.astral.sh/uv/) for fast, rep
 scindra-engine --version
 ```
 
+## Smoke tests
+
+The `smoke_latest` script provides an adaptive smoke test that detects available CLI capabilities and exercises the most end-to-end path available. It uses CLI commands exclusively and produces artifacts in `out/smoke_latest/<timestamp>/`.
+
+**Basic usage:**
+```bash
+bash scripts/smoke_latest.sh
+```
+
+**With optional real video testing:**
+```bash
+VIDEO_PATH=/path/to/video.mp4 bash scripts/smoke_latest.sh
+```
+
+**Strict mode (fail on real video errors):**
+```bash
+STRICT_REAL_VIDEO=1 VIDEO_PATH=/path/to/video.mp4 bash scripts/smoke_latest.sh
+```
+
+The script automatically adapts to available capabilities:
+- **Baseline UX** (always): `engine-info`, `probe`, `extract-frames`
+- **E3 Config UX** (if available): `init-config`, `validate-config`
+- **Track-Centroid** (if available): runs on synthetic fixtures, validates outputs including `overlay.mp4` and `heatmap.png` when supported
+- **E6.2+ features** (if available): validates `manifest.json` and `support_bundle.zip`
+- **Auto-Setup** (if available): tests arena and assay detection
+- **Batch** (if available): tests batch processing
+
+**Windows PowerShell:**
+```powershell
+.\scripts\smoke_latest.ps1
+```
+
 ## How to cut a release
 
 1. **Bump version**  
