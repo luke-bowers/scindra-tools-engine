@@ -18,6 +18,7 @@ class BackgroundModel:
     """
 
     image: np.ndarray | None = None
+    image_bgr: np.ndarray | None = None  # colour median (for chroma filtering)
     mog2_subtractor: object | None = None  # cv2.BackgroundSubtractorMOG2
 
 
@@ -47,7 +48,15 @@ def build_background(
     # median_n
     stack = np.stack(gray_frames, axis=0).astype(np.float32)
     median = np.median(stack, axis=0).astype(np.uint8)
-    return BackgroundModel(image=median)
+
+    # Also compute BGR median for chrominance-based shadow suppression
+    bgr_frames = [f for f in frames_bgr if f is not None and f.ndim == 3]
+    median_bgr: np.ndarray | None = None
+    if bgr_frames:
+        bgr_stack = np.stack(bgr_frames, axis=0).astype(np.float32)
+        median_bgr = np.median(bgr_stack, axis=0).astype(np.uint8)
+
+    return BackgroundModel(image=median, image_bgr=median_bgr)
 
 
 def preprocess_frame(

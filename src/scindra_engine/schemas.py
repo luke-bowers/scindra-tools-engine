@@ -250,6 +250,13 @@ class TrackingConfig(BaseModel):
         default=4.0, ge=0.0,
         description="Mahalanobis-distance gate in sigma units.",
     )
+    kalman_coast_frames: int = Field(
+        default=5, ge=0,
+        description=(
+            "Maximum consecutive frames to coast on Kalman prediction when "
+            "no detection is found.  0 = disable coasting."
+        ),
+    )
 
 
 class KeyFrameInterpolationConfig(BaseModel):
@@ -288,6 +295,39 @@ class KeyFrameInterpolationConfig(BaseModel):
     )
 
 
+class ChromaFilterConfig(BaseModel):
+    """Chrominance-based shadow suppression.
+
+    Shadows change luminance but not chrominance.  By requiring *either* a
+    minimum chrominance difference *or* a large luminance difference from the
+    background, shadow blobs are suppressed while the mouse is preserved.
+
+    A pixel is kept as foreground when:
+      ``chroma_diff > threshold``  OR  ``luma_diff > luma_threshold``
+
+    This means a dark mouse on a light floor (same hue, huge brightness
+    change) is kept, while a shadow on the floor (same hue, small brightness
+    change) is suppressed.
+
+    Operates in CIE-Lab colour space.
+    """
+
+    enabled: bool = True
+    threshold: int = Field(
+        default=12, ge=1, le=255,
+        description="Minimum chrominance delta (in Lab a/b units) to qualify as foreground.",
+    )
+    luma_threshold: int = Field(
+        default=40, ge=1, le=255,
+        description=(
+            "Minimum luminance delta (Lab L channel) to qualify as foreground "
+            "even when chrominance is similar.  Prevents filtering out dark "
+            "objects on light backgrounds (or vice versa) that share a similar "
+            "hue.  Set higher than the typical shadow luminance drop (~20-30)."
+        ),
+    )
+
+
 class QCConfig(BaseModel):
     min_track_coverage: float = 0.8
     max_jump_rate: float = 0.1
@@ -308,6 +348,10 @@ class TrackCentroidConfig(BaseModel):
     motion_mask: MotionMaskConfig = Field(
         default_factory=MotionMaskConfig,
         description="Motion mask to suppress static foreground features.",
+    )
+    chroma_filter: ChromaFilterConfig = Field(
+        default_factory=ChromaFilterConfig,
+        description="Chrominance-based shadow suppression.",
     )
     arena_roi: ArenaROIConfig = Field(
         default_factory=ArenaROIConfig,

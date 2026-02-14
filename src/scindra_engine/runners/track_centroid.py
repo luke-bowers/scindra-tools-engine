@@ -198,6 +198,7 @@ def _create_scaled_tracking_config(
         kalman_process_noise=config.tracking.kalman_process_noise / (factor * factor),
         kalman_measurement_noise=config.tracking.kalman_measurement_noise / (factor * factor),
         kalman_gate_sigma=config.tracking.kalman_gate_sigma,
+        kalman_coast_frames=config.tracking.kalman_coast_frames,
     )
     
     # Create a new config with scaled tracking
@@ -207,6 +208,7 @@ def _create_scaled_tracking_config(
         morphology=config.morphology,
         tracking=scaled_tracking,
         motion_mask=config.motion_mask,
+        chroma_filter=config.chroma_filter,
         arena_roi=config.arena_roi,
         key_frame_interpolation=config.key_frame_interpolation,
         progress_interval=config.progress_interval,
@@ -343,17 +345,55 @@ def _track_video(
         )
     # ---------------------------------------------------------------------
 
+    coast_limit = effective_config.tracking.kalman_coast_frames
+
     for idx, frame in reader.iter_frames():
         # Downsample frame if downsampling is enabled
         if downsample_factor is not None:
             frame = _downsample_frame(frame, downsample_factor)
-        
+
+        # Raw grayscale (original intensity — for candidate scoring)
+        raw_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame.copy()
+
         gray = preprocess_frame(frame, effective_config.preprocessing, background)
         mask = segment_frame(gray, effective_config.segmentation, effective_config.morphology)
 
         # Apply arena ROI mask — discard foreground outside the arena
         if arena_mask is not None:
             mask = cv2.bitwise_and(mask, arena_mask)
+
+        # Chrominance / luminance filter — suppress shadows while keeping
+        # objects that differ from the background in *either* colour or
+        # brightness.  A shadow has the same hue AND a small brightness
+        # change; a real object (the mouse) will differ in at least one.
+        if (
+            effective_config.chroma_filter.enabled
+            and background is not None
+            and background.image_bgr is not None
+            and frame.ndim == 3
+        ):
+            lab_f = cv2.cvtColor(frame, cv2.COLOR_BGR2Lab)
+            lab_bg = cv2.cvtColor(background.image_bgr, cv2.COLOR_BGR2Lab)
+            chroma_diff = cv2.max(
+                cv2.absdiff(lab_f[:, :, 1], lab_bg[:, :, 1]),
+                cv2.absdiff(lab_f[:, :, 2], lab_bg[:, :, 2]),
+            )
+            luma_diff = cv2.absdiff(lab_f[:, :, 0], lab_bg[:, :, 0])
+            # Keep pixel if chrominance differs OR luminance differs a lot
+            _, chroma_ok = cv2.threshold(
+                chroma_diff,
+                effective_config.chroma_filter.threshold,
+                255,
+                cv2.THRESH_BINARY,
+            )
+            _, luma_ok = cv2.threshold(
+                luma_diff,
+                effective_config.chroma_filter.luma_threshold,
+                255,
+                cv2.THRESH_BINARY,
+            )
+            chroma_mask = cv2.bitwise_or(chroma_ok, luma_ok)
+            mask = cv2.bitwise_and(mask, chroma_mask)
 
         # Apply motion mask — discard static foreground
         if motion is not None:
@@ -382,7 +422,7 @@ def _track_video(
             previous=previous,
             ambiguity_confidence=effective_config.ambiguity_confidence,
             shadow_confidence=effective_config.shadow_confidence,
-            gray_frame=gray,
+            gray_frame=raw_gray,
             kalman=kalman,
             adaptive_area=area_filter,
         )
@@ -408,6 +448,23 @@ def _track_video(
         else:
             if kalman is not None and kalman.initialized:
                 kalman.mark_no_measurement()
+                # --- Kalman coasting: emit predicted position -----------
+                if coast_limit > 0 and kalman.frames_without_measurement <= coast_limit:
+                    pred = kalman.predicted_position
+                    if pred is not None:
+                        coast_conf = max(
+                            0.30,
+                            0.85 - 0.01 * kalman.frames_without_measurement,
+                        )
+                        point = TrackPoint(
+                            frame_idx=idx,
+                            x=pred[0],
+                            y=pred[1],
+                            area=previous.area if previous is not None and previous.area is not None else None,
+                            confidence=coast_conf,
+                            flags=["KALMAN_COAST"],
+                        )
+                # --------------------------------------------------------
         # -----------------------------------------------------------------
 
         # Scale coordinates back to original resolution
@@ -555,19 +612,55 @@ def _process_chunk(
         )
     # ---------------------------------------------------------------------
 
+    coast_limit = effective_config.tracking.kalman_coast_frames
+
     with VideoReader(video_path) as reader:
         frame_count = 0
         for idx, frame in reader.iter_frames(start_frame=chunk_start, end_frame=chunk_end):
             # Downsample frame if downsampling is enabled
             if downsample_factor is not None:
                 frame = _downsample_frame(frame, downsample_factor)
-            
+
+            # Raw grayscale (original intensity — for candidate scoring)
+            raw_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame.copy()
+
             gray = preprocess_frame(frame, effective_config.preprocessing, background)
             mask = segment_frame(gray, effective_config.segmentation, effective_config.morphology)
 
             # Apply arena ROI mask — discard foreground outside the arena
             if arena_mask is not None:
                 mask = cv2.bitwise_and(mask, arena_mask)
+
+            # Chrominance / luminance filter — suppress shadows while keeping
+            # objects that differ from the background in colour or brightness.
+            if (
+                effective_config.chroma_filter.enabled
+                and background is not None
+                and background.image_bgr is not None
+                and frame.ndim == 3
+            ):
+                lab_f = cv2.cvtColor(frame, cv2.COLOR_BGR2Lab)
+                lab_bg = cv2.cvtColor(background.image_bgr, cv2.COLOR_BGR2Lab)
+                chroma_diff = cv2.max(
+                    cv2.absdiff(lab_f[:, :, 1], lab_bg[:, :, 1]),
+                    cv2.absdiff(lab_f[:, :, 2], lab_bg[:, :, 2]),
+                )
+                luma_diff = cv2.absdiff(lab_f[:, :, 0], lab_bg[:, :, 0])
+                # Keep pixel if chrominance differs OR luminance differs a lot
+                _, chroma_ok = cv2.threshold(
+                    chroma_diff,
+                    effective_config.chroma_filter.threshold,
+                    255,
+                    cv2.THRESH_BINARY,
+                )
+                _, luma_ok = cv2.threshold(
+                    luma_diff,
+                    effective_config.chroma_filter.luma_threshold,
+                    255,
+                    cv2.THRESH_BINARY,
+                )
+                chroma_mask = cv2.bitwise_or(chroma_ok, luma_ok)
+                mask = cv2.bitwise_and(mask, chroma_mask)
 
             # Apply motion mask — discard static foreground
             if motion is not None:
@@ -595,7 +688,7 @@ def _process_chunk(
                 previous=previous,
                 ambiguity_confidence=effective_config.ambiguity_confidence,
                 shadow_confidence=effective_config.shadow_confidence,
-                gray_frame=gray,
+                gray_frame=raw_gray,
                 kalman=kalman,
                 adaptive_area=area_filter,
             )
@@ -620,6 +713,23 @@ def _process_chunk(
             else:
                 if kalman is not None and kalman.initialized:
                     kalman.mark_no_measurement()
+                    # --- Kalman coasting ---
+                    if coast_limit > 0 and kalman.frames_without_measurement <= coast_limit:
+                        pred = kalman.predicted_position
+                        if pred is not None:
+                            coast_conf = max(
+                                0.30,
+                                0.85 - 0.01 * kalman.frames_without_measurement,
+                            )
+                            point = TrackPoint(
+                                frame_idx=idx,
+                                x=pred[0],
+                                y=pred[1],
+                                area=previous.area if previous is not None and previous.area is not None else None,
+                                confidence=coast_conf,
+                                flags=["KALMAN_COAST"],
+                            )
+                    # -----------------------
             # -------------------------------------------------------------
 
             # Scale coordinates back to original resolution

@@ -294,8 +294,8 @@ def _select_candidate(
         else:
             # Bootstrap: no previous → no distance score
             return (
-                0.40 * solidity_score
-                + 0.15 * intensity_score
+                0.35 * solidity_score
+                + 0.25 * intensity_score
                 - shadow_penalty
             )
 
@@ -307,10 +307,10 @@ def _select_candidate(
             area_score = max(0.0, min(1.0, float(ratio)))
 
         return (
-            0.40 * distance_score
-            + 0.20 * solidity_score
+            0.30 * distance_score
+            + 0.15 * solidity_score
             + 0.15 * area_score
-            + 0.15 * intensity_score
+            + 0.25 * intensity_score
             - shadow_penalty
         )
 
