@@ -8,9 +8,17 @@ import numpy as np
 from scindra_engine.schemas import PreprocessingConfig
 
 
-@dataclass(frozen=True)
+@dataclass
 class BackgroundModel:
-    image: np.ndarray
+    """Background model for frame preprocessing.
+
+    For *median_n*: ``image`` holds the static median background.
+    For *mog2*: ``mog2_subtractor`` wraps a pre-trained
+    ``cv2.BackgroundSubtractorMOG2``.
+    """
+
+    image: np.ndarray | None = None
+    mog2_subtractor: object | None = None  # cv2.BackgroundSubtractorMOG2
 
 
 def build_background(
@@ -25,6 +33,18 @@ def build_background(
     if not gray_frames:
         return None
 
+    if config.background_model == "mog2":
+        subtractor = cv2.createBackgroundSubtractorMOG2(
+            history=config.mog2_history,
+            varThreshold=config.mog2_var_threshold,
+            detectShadows=config.mog2_detect_shadows,
+        )
+        # Pre-train on the sampled frames so the model starts warm
+        for g in gray_frames:
+            subtractor.apply(g, learningRate=0.05)
+        return BackgroundModel(mog2_subtractor=subtractor)
+
+    # median_n
     stack = np.stack(gray_frames, axis=0).astype(np.float32)
     median = np.median(stack, axis=0).astype(np.uint8)
     return BackgroundModel(image=median)
@@ -38,8 +58,14 @@ def preprocess_frame(
     gray = _to_grayscale(frame_bgr, config)
 
     if background is not None:
-        diff = cv2.absdiff(gray, background.image)
-        gray = diff
+        if background.mog2_subtractor is not None:
+            # MOG2: apply returns foreground mask (0/127/255)
+            fg = background.mog2_subtractor.apply(gray, learningRate=0)  # type: ignore[union-attr]
+            # Keep only definite foreground (value 255), suppress shadows
+            _, gray = cv2.threshold(fg, 200, 255, cv2.THRESH_BINARY)
+        elif background.image is not None:
+            diff = cv2.absdiff(gray, background.image)
+            gray = diff
 
     if config.clahe:
         clahe = cv2.createCLAHE(

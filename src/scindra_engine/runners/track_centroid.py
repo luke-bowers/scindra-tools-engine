@@ -15,10 +15,12 @@ from uuid import uuid4
 import cv2
 import numpy as np
 
+from scindra_engine.kalman_tracker import KalmanPointTracker
+from scindra_engine.motion import MotionAccumulator
 from scindra_engine.preprocess import BackgroundModel, build_background, preprocess_frame
-from scindra_engine.schemas import TrackCentroidConfig
+from scindra_engine.schemas import KeyFrameInterpolationConfig, TrackCentroidConfig
 from scindra_engine.segmentation import segment_frame
-from scindra_engine.tracking import TrackPoint, track_frame
+from scindra_engine.tracking import AdaptiveAreaFilter, TrackPoint, track_frame
 from scindra_engine.video_io import FrameSampler, VideoReader
 from scindra_engine.visualize import write_heatmap_png, write_overlay_video as _write_overlay_video
 
@@ -77,6 +79,9 @@ def run_track_centroid(
         width = reader.width
         height = reader.height
 
+    # Build arena ROI mask once (at processing resolution)
+    arena_mask = _load_or_build_arena_mask(config, height, width)
+
     # Use parallel processing if enabled (default: enabled for videos with sufficient frames)
     # Fall back to sequential for small videos or if parallel processing fails
     effective_workers = parallel_workers if parallel_workers is not None else config.parallel_workers
@@ -90,11 +95,16 @@ def run_track_centroid(
             progress_callback,
             num_workers=effective_workers,
             chunk_size=effective_chunk_size,
+            arena_mask=arena_mask,
         )
     except Exception:
         # Fallback to sequential processing on any error
         with VideoReader(video_path) as reader:
-            points = _track_video(reader, config, background, progress_callback)
+            points = _track_video(reader, config, background, progress_callback, arena_mask=arena_mask)
+
+    # Post-processing: key-frame interpolation
+    if config.key_frame_interpolation.enabled:
+        points = _key_frame_interpolate(points, config.key_frame_interpolation)
 
     per_frame_path = run_dir / "per_frame.csv"
     _write_per_frame(per_frame_path, points)
@@ -181,6 +191,13 @@ def _create_scaled_tracking_config(
         max_jump_px=config.tracking.max_jump_px / factor,
         smoothing=config.tracking.smoothing,
         ema_alpha=config.tracking.ema_alpha,
+        adaptive_area=config.tracking.adaptive_area,
+        adaptive_area_ratio=config.tracking.adaptive_area_ratio,
+        adaptive_area_history=config.tracking.adaptive_area_history,
+        use_kalman=config.tracking.use_kalman,
+        kalman_process_noise=config.tracking.kalman_process_noise / (factor * factor),
+        kalman_measurement_noise=config.tracking.kalman_measurement_noise / (factor * factor),
+        kalman_gate_sigma=config.tracking.kalman_gate_sigma,
     )
     
     # Create a new config with scaled tracking
@@ -189,6 +206,9 @@ def _create_scaled_tracking_config(
         segmentation=config.segmentation,
         morphology=config.morphology,
         tracking=scaled_tracking,
+        motion_mask=config.motion_mask,
+        arena_roi=config.arena_roi,
+        key_frame_interpolation=config.key_frame_interpolation,
         progress_interval=config.progress_interval,
         ambiguity_confidence=config.ambiguity_confidence,
         shadow_confidence=config.shadow_confidence,
@@ -204,7 +224,13 @@ def _build_background(
     if config.preprocessing.background_model == "none":
         return None
     sampler = FrameSampler(reader)
-    frames = [frame for _, frame in sampler.sample(config.preprocessing.background_n)]
+
+    # For MOG2 we sample more frames for a richer pre-training set
+    n_sample = config.preprocessing.background_n
+    if config.preprocessing.background_model == "mog2":
+        n_sample = max(n_sample, 50)
+
+    frames = [frame for _, frame in sampler.sample(n_sample)]
     
     # Downsample frames if downsampling is enabled
     if config.downsample_factor is not None and config.downsample_factor > 1.0:
@@ -213,11 +239,72 @@ def _build_background(
     return build_background(frames, config.preprocessing)
 
 
+def _load_or_build_arena_mask(
+    config: TrackCentroidConfig,
+    orig_height: int,
+    orig_width: int,
+) -> np.ndarray | None:
+    """Load or build the arena ROI mask at processing resolution.
+
+    The returned mask is a single-channel ``uint8`` image where 255 marks
+    pixels *inside* the arena.  It is sized to the processing resolution
+    (i.e. already accounting for ``downsample_factor``).
+
+    Returns ``None`` when arena ROI is disabled.
+    """
+    roi = config.arena_roi
+    if not roi.enabled:
+        return None
+
+    factor = config.downsample_factor
+    if factor is not None and factor > 1.0:
+        proc_w = int(orig_width / factor)
+        proc_h = int(orig_height / factor)
+    else:
+        factor = None  # normalise so later checks are simpler
+        proc_w = orig_width
+        proc_h = orig_height
+
+    # --- mask from image file ---
+    if roi.mask_path is not None:
+        raw = cv2.imread(roi.mask_path, cv2.IMREAD_GRAYSCALE)
+        if raw is None:
+            raise FileNotFoundError(f"Arena mask image not found: {roi.mask_path}")
+        if raw.shape[:2] != (proc_h, proc_w):
+            raw = cv2.resize(raw, (proc_w, proc_h), interpolation=cv2.INTER_NEAREST)
+        _, mask = cv2.threshold(raw, 127, 255, cv2.THRESH_BINARY)
+        return mask
+
+    # --- geometric shape ---
+    if roi.kind is not None and roi.params is not None:
+        mask = np.zeros((proc_h, proc_w), dtype=np.uint8)
+        p = roi.params
+
+        if roi.kind == "CIRCLE":
+            cx, cy, r = p["center_x"], p["center_y"], p["radius"]
+            if factor is not None:
+                cx, cy, r = cx / factor, cy / factor, r / factor
+            cv2.circle(mask, (int(round(cx)), int(round(cy))), int(round(r)), 255, -1)
+
+        elif roi.kind == "RECT":
+            x, y, w, h = p["x"], p["y"], p["w"], p["h"]
+            if factor is not None:
+                x, y, w, h = x / factor, y / factor, w / factor, h / factor
+            x, y, w, h = int(round(x)), int(round(y)), int(round(w)), int(round(h))
+            cv2.rectangle(mask, (x, y), (x + w, y + h), 255, -1)
+
+        return mask
+
+    # Shouldn't reach here due to schema validator, but be defensive.
+    raise ValueError("Arena ROI is enabled but no mask_path or kind+params provided.")
+
+
 def _track_video(
     reader: VideoReader,
     config: TrackCentroidConfig,
     background: BackgroundModel | None,
     progress_callback: Callable[[int, int], None] | None,
+    arena_mask: np.ndarray | None = None,
 ) -> list[TrackPoint]:
     points: list[TrackPoint] = []
     previous: TrackPoint | None = None
@@ -228,6 +315,34 @@ def _track_video(
     effective_config = _create_scaled_tracking_config(config)
     downsample_factor = config.downsample_factor if config.downsample_factor is not None and config.downsample_factor > 1.0 else None
 
+    # --- NEW: initialise motion / Kalman / adaptive-area state -----------
+    motion: MotionAccumulator | None = None
+    if effective_config.motion_mask.enabled:
+        mc = effective_config.motion_mask
+        motion = MotionAccumulator(
+            history_len=mc.history_len,
+            threshold=mc.threshold,
+            dilate_ksize=mc.dilate_ksize,
+            dilate_iters=mc.dilate_iters,
+        )
+
+    kalman: KalmanPointTracker | None = None
+    if effective_config.tracking.use_kalman:
+        tc = effective_config.tracking
+        kalman = KalmanPointTracker(
+            process_noise=tc.kalman_process_noise,
+            measurement_noise=tc.kalman_measurement_noise,
+            gate_sigma=tc.kalman_gate_sigma,
+        )
+
+    area_filter: AdaptiveAreaFilter | None = None
+    if effective_config.tracking.adaptive_area:
+        area_filter = AdaptiveAreaFilter(
+            ratio=effective_config.tracking.adaptive_area_ratio,
+            history_len=effective_config.tracking.adaptive_area_history,
+        )
+    # ---------------------------------------------------------------------
+
     for idx, frame in reader.iter_frames():
         # Downsample frame if downsampling is enabled
         if downsample_factor is not None:
@@ -235,6 +350,31 @@ def _track_video(
         
         gray = preprocess_frame(frame, effective_config.preprocessing, background)
         mask = segment_frame(gray, effective_config.segmentation, effective_config.morphology)
+
+        # Apply arena ROI mask — discard foreground outside the arena
+        if arena_mask is not None:
+            mask = cv2.bitwise_and(mask, arena_mask)
+
+        # Apply motion mask — discard static foreground
+        if motion is not None:
+            motion_mask = motion.update(gray)
+            # Kalman search window: allow detection near predicted position
+            # even when the mouse is stationary (motion mask would suppress it)
+            if kalman is not None and kalman.initialized:
+                pred = kalman.predicted_position
+                if pred is not None:
+                    r = int(kalman.search_radius())
+                    cv2.circle(
+                        motion_mask,
+                        (int(round(pred[0])), int(round(pred[1]))),
+                        r, 255, -1,
+                    )
+            mask = cv2.bitwise_and(mask, motion_mask)
+
+        # Kalman predict (before track_frame so gating uses the prediction)
+        if kalman is not None and kalman.initialized:
+            kalman.predict()
+
         point = track_frame(
             mask,
             frame_idx=idx,
@@ -242,7 +382,33 @@ def _track_video(
             previous=previous,
             ambiguity_confidence=effective_config.ambiguity_confidence,
             shadow_confidence=effective_config.shadow_confidence,
+            gray_frame=gray,
+            kalman=kalman,
+            adaptive_area=area_filter,
         )
+
+        # --- Update Kalman / adaptive area in processing space -----------
+        if point.x is not None and point.y is not None:
+            if kalman is not None:
+                if not kalman.initialized:
+                    kalman.initialize(point.x, point.y)
+                else:
+                    cx, cy = kalman.update(point.x, point.y)
+                    # Use Kalman-corrected position (smooths jitter)
+                    point = TrackPoint(
+                        frame_idx=point.frame_idx,
+                        x=cx,
+                        y=cy,
+                        area=point.area,
+                        confidence=point.confidence,
+                        flags=point.flags,
+                    )
+            if area_filter is not None and point.area is not None:
+                area_filter.update(point.area)
+        else:
+            if kalman is not None and kalman.initialized:
+                kalman.mark_no_measurement()
+        # -----------------------------------------------------------------
 
         # Scale coordinates back to original resolution
         if downsample_factor is not None and point.x is not None and point.y is not None:
@@ -320,6 +486,7 @@ def _process_chunk(
     apply_ema: bool = False,
     progress_tracker: ThreadSafeProgressTracker | None = None,
     progress_interval: int = 10,
+    arena_mask: np.ndarray | None = None,
 ) -> list[TrackPoint]:
     """Process a chunk of frames from a video.
 
@@ -333,6 +500,7 @@ def _process_chunk(
         apply_ema: Whether to apply EMA smoothing within the chunk (False for parallel processing).
         progress_tracker: Optional thread-safe progress tracker for real-time updates.
         progress_interval: Report progress every N frames within the chunk.
+        arena_mask: Optional arena ROI mask at processing resolution (255 = inside).
 
     Returns:
         List of TrackPoints for frames in [chunk_start, chunk_end).
@@ -358,7 +526,34 @@ def _process_chunk(
         previous: TrackPoint | None = previous_point
     
     ema_point: tuple[float, float] | None = None
-    frames_in_chunk = chunk_end - chunk_start
+
+    # --- NEW: per-chunk state for motion / Kalman / adaptive-area --------
+    motion: MotionAccumulator | None = None
+    if effective_config.motion_mask.enabled:
+        mc = effective_config.motion_mask
+        motion = MotionAccumulator(
+            history_len=mc.history_len,
+            threshold=mc.threshold,
+            dilate_ksize=mc.dilate_ksize,
+            dilate_iters=mc.dilate_iters,
+        )
+
+    kalman: KalmanPointTracker | None = None
+    if effective_config.tracking.use_kalman:
+        tc = effective_config.tracking
+        kalman = KalmanPointTracker(
+            process_noise=tc.kalman_process_noise,
+            measurement_noise=tc.kalman_measurement_noise,
+            gate_sigma=tc.kalman_gate_sigma,
+        )
+
+    area_filter: AdaptiveAreaFilter | None = None
+    if effective_config.tracking.adaptive_area:
+        area_filter = AdaptiveAreaFilter(
+            ratio=effective_config.tracking.adaptive_area_ratio,
+            history_len=effective_config.tracking.adaptive_area_history,
+        )
+    # ---------------------------------------------------------------------
 
     with VideoReader(video_path) as reader:
         frame_count = 0
@@ -369,6 +564,30 @@ def _process_chunk(
             
             gray = preprocess_frame(frame, effective_config.preprocessing, background)
             mask = segment_frame(gray, effective_config.segmentation, effective_config.morphology)
+
+            # Apply arena ROI mask — discard foreground outside the arena
+            if arena_mask is not None:
+                mask = cv2.bitwise_and(mask, arena_mask)
+
+            # Apply motion mask — discard static foreground
+            if motion is not None:
+                motion_mask = motion.update(gray)
+                # Kalman search window: keep detection near predicted pos
+                if kalman is not None and kalman.initialized:
+                    pred = kalman.predicted_position
+                    if pred is not None:
+                        r = int(kalman.search_radius())
+                        cv2.circle(
+                            motion_mask,
+                            (int(round(pred[0])), int(round(pred[1]))),
+                            r, 255, -1,
+                        )
+                mask = cv2.bitwise_and(mask, motion_mask)
+
+            # Kalman predict (before track_frame)
+            if kalman is not None and kalman.initialized:
+                kalman.predict()
+
             point = track_frame(
                 mask,
                 frame_idx=idx,
@@ -376,7 +595,32 @@ def _process_chunk(
                 previous=previous,
                 ambiguity_confidence=effective_config.ambiguity_confidence,
                 shadow_confidence=effective_config.shadow_confidence,
+                gray_frame=gray,
+                kalman=kalman,
+                adaptive_area=area_filter,
             )
+
+            # --- Update Kalman / adaptive area in processing space -------
+            if point.x is not None and point.y is not None:
+                if kalman is not None:
+                    if not kalman.initialized:
+                        kalman.initialize(point.x, point.y)
+                    else:
+                        cx, cy = kalman.update(point.x, point.y)
+                        point = TrackPoint(
+                            frame_idx=point.frame_idx,
+                            x=cx,
+                            y=cy,
+                            area=point.area,
+                            confidence=point.confidence,
+                            flags=point.flags,
+                        )
+                if area_filter is not None and point.area is not None:
+                    area_filter.update(point.area)
+            else:
+                if kalman is not None and kalman.initialized:
+                    kalman.mark_no_measurement()
+            # -------------------------------------------------------------
 
             # Scale coordinates back to original resolution
             if downsample_factor is not None and point.x is not None and point.y is not None:
@@ -473,6 +717,133 @@ def _reapply_ema(
     return result
 
 
+def _catmull_rom(p0: float, p1: float, p2: float, p3: float, t: float) -> float:
+    """Catmull-Rom spline interpolation between *p1* and *p2* at parameter *t* in [0, 1]."""
+    t2 = t * t
+    t3 = t2 * t
+    return 0.5 * (
+        (2.0 * p1)
+        + (-p0 + p2) * t
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+    )
+
+
+def _key_frame_interpolate(
+    points: list[TrackPoint],
+    config: KeyFrameInterpolationConfig,
+) -> list[TrackPoint]:
+    """Post-process tracking points using key-frame interpolation.
+
+    Key frames are high-confidence, non-ambiguous frames.  Between consecutive
+    key frames that are at most ``max_gap_frames`` apart, NO_DETECTION gaps are
+    filled and (optionally) points deviating too far from the interpolated path
+    are replaced.
+
+    Args:
+        points: Raw (or EMA-smoothed) tracking points.
+        config: Key-frame interpolation configuration.
+
+    Returns:
+        A new list of ``TrackPoint`` with interpolated values where appropriate.
+    """
+    if not points or not config.enabled:
+        return points
+
+    n = len(points)
+
+    # 1. Identify key-frame indices
+    key_indices: list[int] = []
+    for i, p in enumerate(points):
+        if p.x is None or p.y is None:
+            continue
+        if p.confidence < config.min_confidence:
+            continue
+        if "AMBIGUOUS_TARGET" in p.flags:
+            continue
+        key_indices.append(i)
+
+    if len(key_indices) < 2:
+        return points  # not enough anchors
+
+    # 2. Build result as a mutable copy
+    result = list(points)
+
+    # 3. Walk consecutive key-frame pairs and interpolate the gaps
+    for ki in range(len(key_indices) - 1):
+        i_start = key_indices[ki]
+        i_end = key_indices[ki + 1]
+        gap = i_end - i_start - 1
+
+        if gap <= 0 or gap > config.max_gap_frames:
+            continue
+
+        kf_s = points[i_start]
+        kf_e = points[i_end]
+
+        # For cubic Catmull-Rom we need the flanking key frames (p0, p3).
+        use_cubic = config.method == "cubic" and len(key_indices) >= 2
+        if use_cubic:
+            if ki > 0:
+                p0_idx = key_indices[ki - 1]
+                p0_x, p0_y = points[p0_idx].x, points[p0_idx].y
+            else:
+                # Mirror about kf_s
+                p0_x = 2.0 * kf_s.x - kf_e.x  # type: ignore[operator]
+                p0_y = 2.0 * kf_s.y - kf_e.y  # type: ignore[operator]
+
+            if ki + 2 < len(key_indices):
+                p3_idx = key_indices[ki + 2]
+                p3_x, p3_y = points[p3_idx].x, points[p3_idx].y
+            else:
+                p3_x = 2.0 * kf_e.x - kf_s.x  # type: ignore[operator]
+                p3_y = 2.0 * kf_e.y - kf_s.y  # type: ignore[operator]
+
+        for k in range(i_start + 1, i_end):
+            orig = points[k]
+            t = (k - i_start) / (i_end - i_start)
+
+            if use_cubic:
+                interp_x = _catmull_rom(p0_x, kf_s.x, kf_e.x, p3_x, t)  # type: ignore[arg-type]
+                interp_y = _catmull_rom(p0_y, kf_s.y, kf_e.y, p3_y, t)  # type: ignore[arg-type]
+            else:
+                interp_x = kf_s.x + t * (kf_e.x - kf_s.x)  # type: ignore[operator]
+                interp_y = kf_s.y + t * (kf_e.y - kf_s.y)  # type: ignore[operator]
+
+            # Decide whether to replace this frame
+            should_replace = False
+            if orig.x is None or orig.y is None:
+                should_replace = True
+            elif config.max_deviation_px is not None:
+                dev = float(np.hypot(orig.x - interp_x, orig.y - interp_y))
+                if dev > config.max_deviation_px:
+                    should_replace = True
+
+            if should_replace:
+                # Interpolate area between key frames
+                if kf_s.area is not None and kf_e.area is not None:
+                    interp_area = kf_s.area + t * (kf_e.area - kf_s.area)
+                else:
+                    interp_area = orig.area
+
+                flags = [f for f in (orig.flags or []) if f != "NO_DETECTION"]
+                if "INTERPOLATED" not in flags:
+                    flags.append("INTERPOLATED")
+
+                interp_conf = min(kf_s.confidence, kf_e.confidence) * 0.8
+
+                result[k] = TrackPoint(
+                    frame_idx=orig.frame_idx,
+                    x=interp_x,
+                    y=interp_y,
+                    area=interp_area,
+                    confidence=interp_conf,
+                    flags=flags,
+                )
+
+    return result
+
+
 def _track_video_parallel(
     video_path: Path,
     config: TrackCentroidConfig,
@@ -481,6 +852,7 @@ def _track_video_parallel(
     *,
     num_workers: int | None = None,
     chunk_size: int = 200,
+    arena_mask: np.ndarray | None = None,
 ) -> list[TrackPoint]:
     """Track video frames using parallel chunk processing.
 
@@ -491,6 +863,7 @@ def _track_video_parallel(
         progress_callback: Optional callback for progress updates.
         num_workers: Number of parallel workers (default: CPU count).
         chunk_size: Number of frames per chunk.
+        arena_mask: Optional arena ROI mask at processing resolution (255 = inside).
 
     Returns:
         List of TrackPoints for all frames.
@@ -502,10 +875,15 @@ def _track_video_parallel(
     if total_frames <= 0:
         return []
 
+    # MOG2 background is stateful — force sequential processing
+    if background is not None and background.mog2_subtractor is not None:
+        with VideoReader(video_path) as reader:
+            return _track_video(reader, config, background, progress_callback, arena_mask=arena_mask)
+
     # Use sequential processing for small videos
     if total_frames <= chunk_size:
         with VideoReader(video_path) as reader:
-            return _track_video(reader, config, background, progress_callback)
+            return _track_video(reader, config, background, progress_callback, arena_mask=arena_mask)
 
     # Determine number of workers
     if num_workers is None:
@@ -570,6 +948,7 @@ def _track_video_parallel(
                     apply_ema=False,  # Don't apply EMA in chunks, will apply globally after merging
                     progress_tracker=progress_tracker,
                     progress_interval=progress_interval,
+                    arena_mask=arena_mask,
                 )
                 future_to_chunk[future] = chunk_idx
 
@@ -587,7 +966,7 @@ def _track_video_parallel(
                     if progress_callback:
                         progress_callback(0, total_frames)
                     with VideoReader(video_path) as reader:
-                        return _track_video(reader, config, background, progress_callback)
+                        return _track_video(reader, config, background, progress_callback, arena_mask=arena_mask)
 
             # Merge chunks in order
             for chunk_idx in sorted(chunk_results.keys()):

@@ -71,6 +71,65 @@ class ArenaDetectionConfig(BaseModel):
     min_confidence_to_auto_accept: float = Field(default=0.85, ge=0.0, le=1.0)
 
 
+class ArenaROIConfig(BaseModel):
+    """Restrict tracking to a region of interest (arena mask).
+
+    When enabled, the segmentation mask is AND-ed with the arena mask so that
+    only detections inside the arena are considered.  This prevents the tracker
+    from latching onto high-contrast objects outside the arena (e.g. door
+    handles, labels on the cage).
+
+    Specify the ROI either via ``mask_path`` (a binary image where white pixels
+    mark the valid region) or via ``kind`` + ``params`` (a geometric shape).
+    All coordinate/size parameters are given in **original video resolution**;
+    they are automatically scaled when ``downsample_factor`` is used.
+    """
+
+    enabled: bool = False
+    mask_path: str | None = Field(
+        default=None,
+        description="Path to a binary mask image (white pixels = inside arena).",
+    )
+    kind: Literal["CIRCLE", "RECT"] | None = Field(
+        default=None,
+        description="Geometric shape for the ROI.",
+    )
+    params: dict[str, float] | None = Field(
+        default=None,
+        description=(
+            "Shape parameters in original video coordinates. "
+            "CIRCLE: {center_x, center_y, radius}. "
+            "RECT: {x, y, w, h}."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_roi_source(self) -> ArenaROIConfig:
+        if not self.enabled:
+            return self
+        if self.mask_path is None and self.kind is None:
+            raise ValueError(
+                "Arena ROI is enabled but neither mask_path nor kind is set."
+            )
+        if self.kind is not None and self.params is None:
+            raise ValueError(
+                "Arena ROI kind is set but params is missing."
+            )
+        if self.kind == "CIRCLE":
+            required = {"center_x", "center_y", "radius"}
+            if self.params is None or not required.issubset(self.params):
+                raise ValueError(
+                    f"CIRCLE ROI requires params: {required}"
+                )
+        elif self.kind == "RECT":
+            required = {"x", "y", "w", "h"}
+            if self.params is None or not required.issubset(self.params):
+                raise ValueError(
+                    f"RECT ROI requires params: {required}"
+                )
+        return self
+
+
 class ZonesConfig(BaseModel):
     enabled: bool = True
     mode: Literal["AUTO_TEMPLATE", "MANUAL"] = "AUTO_TEMPLATE"
@@ -84,8 +143,11 @@ class PreprocessingConfig(BaseModel):
     gamma: float | None = None
     denoise: Literal["none", "gaussian", "bilateral"] = "none"
     illumination_correction: Literal["none", "rolling_ball", "morph_open"] = "none"
-    background_model: Literal["none", "median_n"] = "median_n"
+    background_model: Literal["none", "median_n", "mog2"] = "median_n"
     background_n: int = 25
+    mog2_history: int = Field(default=500, ge=1, description="MOG2 history length (frames).")
+    mog2_var_threshold: float = Field(default=16.0, ge=0.0, description="MOG2 variance threshold.")
+    mog2_detect_shadows: bool = Field(default=True, description="MOG2 shadow detection.")
 
 
 class SegmentationConfig(BaseModel):
@@ -119,10 +181,37 @@ class SegmentationConfig(BaseModel):
 
 
 class MorphologyConfig(BaseModel):
-    open_ksize: int = 3
-    close_ksize: int = 3
+    open_ksize: int = 5
+    close_ksize: int = 7
     erode_iters: int = 0
     dilate_iters: int = 0
+
+
+class MotionMaskConfig(BaseModel):
+    """Frame-difference motion mask to suppress static foreground features.
+
+    When enabled, only pixels that changed in the last ``history_len``
+    frames are kept as foreground.  This eliminates static high-contrast
+    objects (maze ring, screws, labels) that survive background subtraction.
+    """
+
+    enabled: bool = True
+    history_len: int = Field(
+        default=10, ge=1,
+        description="Number of past frames kept for motion comparison.",
+    )
+    threshold: int = Field(
+        default=15, ge=1, le=255,
+        description="Pixel-change threshold to qualify as motion.",
+    )
+    dilate_ksize: int = Field(
+        default=7, ge=1,
+        description="Dilation kernel size applied to the raw motion mask.",
+    )
+    dilate_iters: int = Field(
+        default=3, ge=0,
+        description="Number of dilation iterations.",
+    )
 
 
 class TrackingConfig(BaseModel):
@@ -131,6 +220,72 @@ class TrackingConfig(BaseModel):
     max_jump_px: float = 80.0
     smoothing: Literal["none", "ema"] = "none"
     ema_alpha: float = 0.3
+    # --- adaptive area ---
+    adaptive_area: bool = Field(
+        default=True,
+        description="Narrow the area filter around a running median of recent detections.",
+    )
+    adaptive_area_ratio: float = Field(
+        default=3.0, ge=1.0,
+        description="Allowed area range: [median / ratio, median * ratio].",
+    )
+    adaptive_area_history: int = Field(
+        default=30, ge=3,
+        description="Number of recent detections used for the running median.",
+    )
+    # --- Kalman filter ---
+    use_kalman: bool = Field(
+        default=True,
+        description="Use a Kalman filter for prediction-based gating and scoring.",
+    )
+    kalman_process_noise: float = Field(
+        default=4.0, ge=0.0,
+        description="Kalman process-noise covariance diagonal (pixel^2).",
+    )
+    kalman_measurement_noise: float = Field(
+        default=4.0, ge=0.0,
+        description="Kalman measurement-noise covariance diagonal (pixel^2).",
+    )
+    kalman_gate_sigma: float = Field(
+        default=4.0, ge=0.0,
+        description="Mahalanobis-distance gate in sigma units.",
+    )
+
+
+class KeyFrameInterpolationConfig(BaseModel):
+    """Post-processing pass that identifies high-confidence key frames and
+    interpolates between them to fill NO_DETECTION gaps and correct drift.
+
+    A frame qualifies as a key frame when its confidence meets
+    ``min_confidence`` and it has no ``AMBIGUOUS_TARGET`` flag.  Between two
+    key frames, NO_DETECTION frames (and optionally points that deviate too
+    far from the interpolated path) are replaced with interpolated positions.
+    """
+
+    enabled: bool = False
+    min_confidence: float = Field(
+        default=0.85,
+        ge=0.0,
+        le=1.0,
+        description="Minimum confidence for a frame to qualify as a key frame.",
+    )
+    max_gap_frames: int = Field(
+        default=30,
+        ge=1,
+        description="Maximum number of consecutive non-key frames to interpolate across.",
+    )
+    max_deviation_px: float | None = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "Points deviating more than this from the interpolated path are "
+            "replaced.  None = only fill NO_DETECTION gaps."
+        ),
+    )
+    method: Literal["linear", "cubic"] = Field(
+        default="linear",
+        description="Interpolation method between key frames.",
+    )
 
 
 class QCConfig(BaseModel):
@@ -150,6 +305,18 @@ class TrackCentroidConfig(BaseModel):
     )
     morphology: MorphologyConfig = Field(default_factory=MorphologyConfig)
     tracking: TrackingConfig = Field(default_factory=TrackingConfig)
+    motion_mask: MotionMaskConfig = Field(
+        default_factory=MotionMaskConfig,
+        description="Motion mask to suppress static foreground features.",
+    )
+    arena_roi: ArenaROIConfig = Field(
+        default_factory=ArenaROIConfig,
+        description="Optional arena region-of-interest mask to restrict tracking.",
+    )
+    key_frame_interpolation: KeyFrameInterpolationConfig = Field(
+        default_factory=KeyFrameInterpolationConfig,
+        description="Optional key-frame interpolation post-processing.",
+    )
     progress_interval: int = Field(default=50, ge=1)
     ambiguity_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
     shadow_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
