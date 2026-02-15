@@ -262,6 +262,56 @@ def track_centroid(
         min=1.0,
         help="Downsample frames by this factor before processing (e.g., 2.0 = half resolution). Coordinates are scaled back to original resolution.",
     ),
+    debug: bool = typer.Option(
+        False,
+        "--debug/--no-debug",
+        help="Enable debug mode: write frames showing centroid blobs (detected/excluded). Uses sequential processing.",
+    ),
+    debug_interval: int | None = typer.Option(
+        None,
+        "--debug-interval",
+        min=1,
+        help="When --debug is set, write a debug frame every N frames (default from config).",
+    ),
+    debug_max_frames: int | None = typer.Option(
+        None,
+        "--debug-max-frames",
+        min=1,
+        help="When --debug is set, cap the number of debug frames. Omit for config default; use 0 for no cap (requires config support).",
+    ),
+    detector: bool = typer.Option(
+        False,
+        "--detector/--no-detector",
+        help="Enable detector-assisted ROI tracking (requires scindra-engine[detector]).",
+    ),
+    detector_model: Path | None = typer.Option(
+        None,
+        "--detector-model",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        help="Path to the YOLOX ONNX model file.",
+    ),
+    detector_every_n: int | None = typer.Option(
+        None,
+        "--detector-every-n",
+        min=1,
+        help="Run detector every N frames (default: 15).",
+    ),
+    detector_min_score: float | None = typer.Option(
+        None,
+        "--detector-min-score",
+        min=0.0,
+        max=1.0,
+        help="Minimum detector score to accept a detection (default: 0.35).",
+    ),
+    roi_padding_px: int | None = typer.Option(
+        None,
+        "--roi-padding-px",
+        min=0,
+        help="Pixels to pad around the detector bounding box for the ROI (default: 60).",
+    ),
 ) -> None:
     """Track a centroid using the classical backend."""
     try:
@@ -270,10 +320,38 @@ def track_centroid(
             config = TrackCentroidConfig.model_validate(data)
         else:
             config = TrackCentroidConfig.model_validate({})
-        
-        # Override downsample_factor from CLI if provided
+
+        overrides: dict[str, object] = {}
         if downsample_factor is not None:
-            config.downsample_factor = downsample_factor
+            overrides["downsample_factor"] = downsample_factor
+        if debug:
+            overrides["debug_mode"] = True
+        if debug_interval is not None:
+            overrides["debug_frame_interval"] = debug_interval
+        if debug_max_frames is not None:
+            overrides["debug_max_frames"] = debug_max_frames
+        if overrides:
+            config = config.model_copy(update=overrides)
+
+        # --- Detector setup ---
+        det_instance = None
+        if detector or config.detector.enabled:
+            det_instance = _try_create_detector(
+                model_path=str(detector_model) if detector_model else config.detector.model_path,
+                fallback=config.detector.fallback_to_classical_full_frame,
+            )
+            # Apply detector CLI overrides
+            det_overrides: dict[str, object] = {"enabled": True}
+            if detector_model is not None:
+                det_overrides["model_path"] = str(detector_model)
+            if detector_every_n is not None:
+                det_overrides["every_n_frames"] = detector_every_n
+            if detector_min_score is not None:
+                det_overrides["min_score"] = detector_min_score
+            if roi_padding_px is not None:
+                det_overrides["roi_padding_px"] = roi_padding_px
+            new_det_cfg = config.detector.model_copy(update=det_overrides)
+            config = config.model_copy(update={"detector": new_det_cfg})
 
         # Track start time for progress reporting
         start_time = time.time()
@@ -330,6 +408,7 @@ def track_centroid(
             trail_length=trail_length,
             parallel_workers=workers,
             chunk_size=chunk_size,
+            detector=det_instance,
         )
     except (FileNotFoundError, VideoIOError, OSError) as e:
         typer.echo(f"Error: could not open video '{video}': {e}", err=True)
@@ -340,3 +419,136 @@ def track_centroid(
     except Exception as e:
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(code=1)
+
+
+def _try_create_detector(
+    model_path: str | None,
+    fallback: bool,
+) -> object | None:
+    """Attempt to create a YOLOX ONNX detector instance.
+
+    Returns the detector or None (with warnings).
+    """
+    from scindra_engine.detectors.base import ModelResolver
+
+    try:
+        # Check onnxruntime availability first
+        import onnxruntime as _ort  # noqa: F401
+    except ImportError:
+        msg = (
+            "Detector enabled but optional dependency missing. "
+            "Install: pip install scindra-engine[detector]  (or: uv pip install scindra-engine[detector])"
+        )
+        typer.echo(f"WARNING: {msg}", err=True)
+        if not fallback:
+            raise typer.Exit(code=1)
+        typer.echo("WARNING: DETECTOR_DEP_MISSING — continuing with classical-only tracking.", err=True)
+        return None
+
+    resolver = ModelResolver(model_path)
+    resolved = resolver.resolve()
+    if resolved is None:
+        msg = "Detector enabled but no model found (checked --detector-model, SCINDRA_YOLOX_ONNX_PATH, packaged asset)."
+        typer.echo(f"WARNING: DETECTOR_UNAVAILABLE — {msg}", err=True)
+        if not fallback:
+            raise typer.Exit(code=1)
+        return None
+
+    from scindra_engine.detectors.yolox_onnx import YOLOXOnnxDetector
+
+    path, meta = resolved
+    return YOLOXOnnxDetector(str(path), meta)
+
+
+@app.command("detect-mouse")
+def detect_mouse(
+    video: Path = typer.Option(
+        ..., "--video", exists=True, file_okay=True, dir_okay=False, readable=True, help="Input video path"
+    ),
+    out_dir: Path = typer.Option(
+        ..., "--out", file_okay=False, help="Output directory"
+    ),
+    model: Path | None = typer.Option(
+        None, "--model", exists=True, file_okay=True, dir_okay=False, readable=True, help="YOLOX ONNX model path"
+    ),
+    every_n: int = typer.Option(
+        15, "--every-n", min=1, help="Run detector every N frames"
+    ),
+) -> None:
+    """Run the YOLOX detector on a video and produce detections.csv + debug frames."""
+    import csv as _csv
+
+    from scindra_engine.detectors.base import ModelResolver
+
+    try:
+        import onnxruntime as _ort  # noqa: F401
+    except ImportError:
+        typer.echo(
+            "Error: onnxruntime is required. Install: pip install scindra-engine[detector]  (or: uv pip install scindra-engine[detector])",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    resolver = ModelResolver(str(model) if model else None)
+    resolved = resolver.resolve()
+    if resolved is None:
+        typer.echo(
+            "Error: no YOLOX model found (provide --model, set SCINDRA_YOLOX_ONNX_PATH, or bundle asset).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    from scindra_engine.detectors.yolox_onnx import YOLOXOnnxDetector
+
+    model_path, meta = resolved
+    det = YOLOXOnnxDetector(str(model_path), meta)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "detections.csv"
+    debug_dir = out_dir / "debug_frames"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    import cv2 as _cv2
+
+    total_frames = 0
+    detection_count = 0
+    scores: list[float] = []
+    debug_written = 0
+    max_debug = 10
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = _csv.writer(f)
+        writer.writerow(["frame", "score", "x1", "y1", "x2", "y2"])
+
+        with VideoReader(video) as reader:
+            total_frames = reader.frame_count
+            debug_step = max(1, total_frames // (every_n * max_debug)) * every_n
+
+            for idx, frame in reader.iter_frames():
+                if idx % every_n != 0:
+                    continue
+                result = det.detect(frame)
+                if result.best is not None:
+                    b = result.best
+                    writer.writerow([idx, f"{b.score:.4f}", *b.bbox_xyxy])
+                    detection_count += 1
+                    scores.append(b.score)
+                else:
+                    writer.writerow([idx, "", "", "", "", ""])
+
+                # Debug frames (sampled)
+                if debug_written < max_debug and (idx % debug_step == 0 or idx == 0):
+                    if result.best is not None:
+                        x1, y1, x2, y2 = result.best.bbox_xyxy
+                        _cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    _cv2.imwrite(str(debug_dir / f"det_{idx:06d}.png"), frame)
+                    debug_written += 1
+
+    frames_checked = (total_frames + every_n - 1) // every_n if total_frames > 0 else 0
+    coverage_pct = (detection_count / frames_checked * 100.0) if frames_checked > 0 else 0.0
+    mean_score = sum(scores) / len(scores) if scores else 0.0
+
+    typer.echo(f"Frames checked: {frames_checked}")
+    typer.echo(f"Detections: {detection_count} ({coverage_pct:.1f}%)")
+    typer.echo(f"Mean score: {mean_score:.4f}")
+    typer.echo(f"Output: {csv_path}")

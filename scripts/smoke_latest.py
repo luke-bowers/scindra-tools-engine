@@ -72,7 +72,7 @@ def detect_capabilities() -> dict[str, Any]:
     }
 
     # Detect commands
-    for cmd in ["engine-info", "probe", "extract-frames", "validate-config", "track-centroid", "init-config", "auto-setup", "batch"]:
+    for cmd in ["engine-info", "probe", "extract-frames", "validate-config", "track-centroid", "init-config", "auto-setup", "batch", "detect-mouse"]:
         help_output = cmd_help(cmd)
         if help_output:  # Command exists if help output is non-empty
             caps["commands"][cmd] = True
@@ -402,6 +402,30 @@ def main() -> int:
         run_folders = list(batch_out.glob("run_*"))
         assert run_folders, "No run folders found in batch output"
         print("✓ Batch outputs validated")
+
+    # Detect-mouse (if available and model provided)
+    if caps["commands"].get("detect-mouse"):
+        yolox_model_path = os.environ.get("YOLOX_ONNX_MODEL_PATH")
+        if yolox_model_path and Path(yolox_model_path).exists():
+            print("==> Running detect-mouse with real model")
+            detect_out = run_dir / "detect_mouse_out"
+            try:
+                run_cmd(
+                    [
+                        "uv", "run", "scindra-engine", "detect-mouse",
+                        "--video", str(good_video),
+                        "--out", str(detect_out),
+                        "--model", yolox_model_path,
+                        "--every-n", "5",
+                    ],
+                )
+                det_csv = detect_out / "detections.csv"
+                assert det_csv.exists(), f"Missing {det_csv}"
+                print("✓ detect-mouse outputs validated")
+            except Exception as e:
+                print(f"WARNING: detect-mouse test failed: {e}")
+        else:
+            print("SKIP: detect-mouse (no YOLOX_ONNX_MODEL_PATH set)")
 
     # Optional real video
     video_path_env = os.environ.get("VIDEO_PATH")

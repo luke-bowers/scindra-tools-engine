@@ -20,6 +20,54 @@ For development, the project uses [uv](https://docs.astral.sh/uv/) for fast, rep
 scindra-engine --version
 ```
 
+## Detector-assisted tracking (optional)
+
+The engine supports an optional YOLOX-based object detector that constrains
+centroid tracking to a detection-based ROI. This reduces false-tracking on
+shadows and other artefacts.
+
+### Installing detector dependencies
+
+```bash
+uv pip install scindra-engine[detector]
+```
+
+This adds `onnxruntime` (CPU-only, MIT license). The core engine continues to
+work without it.
+
+### Running with the detector
+
+```bash
+# Track with detector-assisted ROI
+scindra-engine track-centroid \
+  --video path/to/video.mp4 \
+  --out out/results \
+  --detector \
+  --detector-model /path/to/yolox_mouse_640.onnx
+
+# Standalone detection (debug / verification)
+scindra-engine detect-mouse \
+  --video path/to/video.mp4 \
+  --out out/detections \
+  --model /path/to/yolox_mouse_640.onnx
+```
+
+### Model provisioning
+
+The engine **does not** ship model weights by default. Model resolution order:
+
+1. `--detector-model` / `--model` CLI flag (highest precedence)
+2. `SCINDRA_YOLOX_ONNX_PATH` environment variable
+3. Packaged asset at `scindra_engine/assets/models/yolox_mouse_640.onnx` (for
+   desktop bundling)
+
+If no model is found, the detector is unavailable and the pipeline continues
+with classical-only tracking (a `DETECTOR_UNAVAILABLE` warning is emitted).
+
+An optional `.json` sidecar (same name as the `.onnx` file) can specify model
+metadata (input size, score threshold, NMS IoU, class names). If absent, safe
+defaults are used.
+
 ## Smoke tests
 
 The `smoke_latest` script provides an adaptive smoke test that detects available CLI capabilities and exercises the most end-to-end path available. It uses CLI commands exclusively and produces artifacts in `out/smoke_latest/<timestamp>/`.

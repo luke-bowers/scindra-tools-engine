@@ -328,6 +328,56 @@ class ChromaFilterConfig(BaseModel):
     )
 
 
+class DetectorConfig(BaseModel):
+    """Configuration for the optional YOLOX detector-assisted ROI tracking."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable detector-assisted ROI tracking.",
+    )
+    backend: Literal["YOLOX_ONNX"] = "YOLOX_ONNX"
+    model_path: str | None = Field(
+        default=None,
+        description="Explicit path to the ONNX model file.",
+    )
+    min_score: float = Field(
+        default=0.35, ge=0.0, le=1.0,
+        description="Minimum detector score to accept a detection for ROI.",
+    )
+    every_n_frames: int = Field(
+        default=15, ge=1,
+        description="Run the detector every N frames.",
+    )
+    reacquire_on_low_tracking_conf: bool = Field(
+        default=True,
+        description="Re-run detector when tracking confidence drops.",
+    )
+    roi_padding_px: int = Field(
+        default=60, ge=0,
+        description="Pixels to pad around the detector bounding box for the ROI.",
+    )
+    roi_padding_scale: float | None = Field(
+        default=None, ge=1.0,
+        description="Alternative: scale factor for ROI around bbox (e.g. 1.5x).",
+    )
+    max_roi_jump_px: float = Field(
+        default=200.0, ge=0.0,
+        description="Max allowed jump in ROI center; larger triggers hysteresis.",
+    )
+    fallback_to_classical_full_frame: bool = Field(
+        default=True,
+        description="Fall back to classical full-frame tracking when detector unavailable.",
+    )
+    write_detector_debug_frames: bool = Field(
+        default=True,
+        description="Write sampled debug frames with detector bbox overlay.",
+    )
+    detector_debug_frame_count: int = Field(
+        default=10, ge=1, le=50,
+        description="Number of detector debug frames to write.",
+    )
+
+
 class QCConfig(BaseModel):
     min_track_coverage: float = 0.8
     max_jump_rate: float = 0.1
@@ -361,12 +411,28 @@ class TrackCentroidConfig(BaseModel):
         default_factory=KeyFrameInterpolationConfig,
         description="Optional key-frame interpolation post-processing.",
     )
+    detector: DetectorConfig = Field(
+        default_factory=DetectorConfig,
+        description="Optional detector-assisted ROI tracking.",
+    )
     progress_interval: int = Field(default=50, ge=1)
     ambiguity_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
     shadow_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
     parallel_workers: int | None = Field(default=None, ge=1, description="Number of parallel workers for frame processing (None = auto)")
     chunk_size: int = Field(default=200, ge=1, description="Number of frames per chunk for parallel processing")
     downsample_factor: float | None = Field(default=None, ge=1.0, description="Downsample frames by this factor before processing (e.g., 2.0 = half resolution). Coordinates are scaled back to original resolution.")
+    debug_mode: bool = Field(
+        default=False,
+        description="When True, write debug frames showing centroid blobs (detected/excluded) and use sequential processing.",
+    )
+    debug_frame_interval: int = Field(
+        default=30, ge=1,
+        description="When debug_mode is True, write a debug frame every N frames.",
+    )
+    debug_max_frames: int | None = Field(
+        default=100, ge=1,
+        description="When debug_mode is True, cap the number of debug frames written. None = no cap.",
+    )
 
 
 class OutputsConfig(BaseModel):

@@ -62,7 +62,14 @@ def test_validate_config_invalid() -> None:
     try:
         result = runner.invoke(app, ["validate-config", "--config", str(config_path)])
         assert result.exit_code == 1
-        # Error messages go to stderr
-        assert "invalid" in (result.stdout + result.stderr).lower()
+        # With mix_stderr=True (default), all output goes to result.output
+        assert "invalid" in result.output.lower()
     finally:
         config_path.unlink()
+
+
+def test_detect_mouse_help() -> None:
+    """detect-mouse --help should exit 0."""
+    result = runner.invoke(app, ["detect-mouse", "--help"])
+    assert result.exit_code == 0
+    assert "detect" in result.stdout.lower() or "mouse" in result.stdout.lower()

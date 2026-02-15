@@ -20,7 +20,8 @@ __pycache__/
 .ruff_cache/
 *.pyc
 
-# Test outputs and artifacts
+# Test inputs/outputs and artifacts
+inputs/
 out/
 test_config.json
 invalid_config.json

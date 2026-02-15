@@ -15,14 +15,17 @@ from uuid import uuid4
 import cv2
 import numpy as np
 
+from scindra_engine.detectors.base import Detector
+from scindra_engine.detectors.state import DetectorState, FrameDetectorInfo
 from scindra_engine.kalman_tracker import KalmanPointTracker
 from scindra_engine.motion import MotionAccumulator
 from scindra_engine.preprocess import BackgroundModel, build_background, preprocess_frame
 from scindra_engine.schemas import KeyFrameInterpolationConfig, TrackCentroidConfig
 from scindra_engine.segmentation import segment_frame
-from scindra_engine.tracking import AdaptiveAreaFilter, TrackPoint, track_frame
+from scindra_engine.tracking import AdaptiveAreaFilter, TrackFrameDebug, TrackPoint, track_frame
 from scindra_engine.video_io import FrameSampler, VideoReader
 from scindra_engine.visualize import write_heatmap_png, write_overlay_video as _write_overlay_video
+from scindra_engine.visualize.debug_blobs import render_debug_frame
 
 
 @dataclass(frozen=True)
@@ -66,6 +69,7 @@ def run_track_centroid(
     trail_length: int | None = None,
     parallel_workers: int | None = None,
     chunk_size: int | None = None,
+    detector: Detector | None = None,
 ) -> TrackCentroidResult:
     run_id = _make_run_id()
     run_dir = out_dir / f"run_{run_id}"
@@ -82,34 +86,60 @@ def run_track_centroid(
     # Build arena ROI mask once (at processing resolution)
     arena_mask = _load_or_build_arena_mask(config, height, width)
 
-    # Use parallel processing if enabled (default: enabled for videos with sufficient frames)
-    # Fall back to sequential for small videos or if parallel processing fails
-    effective_workers = parallel_workers if parallel_workers is not None else config.parallel_workers
-    effective_chunk_size = chunk_size if chunk_size is not None else config.chunk_size
+    # Detector state (if enabled and a detector is provided)
+    detector_state: DetectorState | None = None
+    if config.detector.enabled and detector is not None:
+        detector_state = DetectorState(detector, config.detector)
 
-    try:
-        points = _track_video_parallel(
-            video_path,
-            config,
-            background,
-            progress_callback,
-            num_workers=effective_workers,
-            chunk_size=effective_chunk_size,
-            arena_mask=arena_mask,
-        )
-    except Exception:
-        # Fallback to sequential processing on any error
+    # Debug mode: use sequential processing and write debug frames (blob visualization)
+    debug_frames_dir: Path | None = None
+    if getattr(config, "debug_mode", False):
+        debug_frames_dir = run_dir / "debug_frames"
+        debug_frames_dir.mkdir(parents=True, exist_ok=True)
+
+    # Detector-assisted tracking is inherently sequential (stateful)
+    force_sequential = detector_state is not None
+
+    if debug_frames_dir is not None or force_sequential:
+        # Sequential: required for debug frames or detector-assisted mode
         with VideoReader(video_path) as reader:
-            points = _track_video(reader, config, background, progress_callback, arena_mask=arena_mask)
+            points, det_infos = _track_video(
+                reader,
+                config,
+                background,
+                progress_callback,
+                arena_mask=arena_mask,
+                debug_frames_dir=debug_frames_dir,
+                debug_frame_interval=getattr(config, "debug_frame_interval", 30),
+                debug_max_frames=getattr(config, "debug_max_frames", 100),
+                detector_state=detector_state,
+            )
+    else:
+        effective_workers = parallel_workers if parallel_workers is not None else config.parallel_workers
+        effective_chunk_size = chunk_size if chunk_size is not None else config.chunk_size
+        try:
+            points = _track_video_parallel(
+                video_path,
+                config,
+                background,
+                progress_callback,
+                num_workers=effective_workers,
+                chunk_size=effective_chunk_size,
+                arena_mask=arena_mask,
+            )
+        except Exception:
+            with VideoReader(video_path) as reader:
+                points, _ = _track_video(reader, config, background, progress_callback, arena_mask=arena_mask)
+        det_infos = None
 
     # Post-processing: key-frame interpolation
     if config.key_frame_interpolation.enabled:
         points = _key_frame_interpolate(points, config.key_frame_interpolation)
 
     per_frame_path = run_dir / "per_frame.csv"
-    _write_per_frame(per_frame_path, points)
+    _write_per_frame(per_frame_path, points, det_infos=det_infos)
 
-    summary = _summarize(points, config)
+    summary = _summarize(points, config, det_infos=det_infos)
     summary_path = run_dir / "tracking_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
@@ -140,6 +170,20 @@ def run_track_centroid(
             height=height,
             track_points=points,
             out_path=str(heatmap_path),
+        )
+
+    # Detector debug frames (sampled bbox overlays)
+    if (
+        detector_state is not None
+        and det_infos is not None
+        and config.detector.write_detector_debug_frames
+    ):
+        _write_detector_debug_frames(
+            video_path=video_path,
+            det_infos=det_infos,
+            points=points,
+            out_dir=run_dir / "debug_frames",
+            max_frames=config.detector.detector_debug_frame_count,
         )
 
     return TrackCentroidResult(run_dir=run_dir, points=points, summary=summary)
@@ -211,6 +255,7 @@ def _create_scaled_tracking_config(
         chroma_filter=config.chroma_filter,
         arena_roi=config.arena_roi,
         key_frame_interpolation=config.key_frame_interpolation,
+        detector=config.detector,
         progress_interval=config.progress_interval,
         ambiguity_confidence=config.ambiguity_confidence,
         shadow_confidence=config.shadow_confidence,
@@ -307,8 +352,14 @@ def _track_video(
     background: BackgroundModel | None,
     progress_callback: Callable[[int, int], None] | None,
     arena_mask: np.ndarray | None = None,
-) -> list[TrackPoint]:
+    *,
+    debug_frames_dir: Path | None = None,
+    debug_frame_interval: int = 30,
+    debug_max_frames: int | None = 100,
+    detector_state: DetectorState | None = None,
+) -> tuple[list[TrackPoint], list[FrameDetectorInfo] | None]:
     points: list[TrackPoint] = []
+    det_infos: list[FrameDetectorInfo] | None = [] if detector_state is not None else None
     previous: TrackPoint | None = None
     ema_point: tuple[float, float] | None = None
     total = reader.frame_count
@@ -347,10 +398,37 @@ def _track_video(
 
     coast_limit = effective_config.tracking.kalman_coast_frames
 
+    debug_sink: list[TrackFrameDebug] = []
+    debug_frames_written = 0
+
+    # Tracking confidence for detector scheduling (previous frame's)
+    last_tracking_conf: float = 0.0
+    last_has_centroid: bool = False
+
     for idx, frame in reader.iter_frames():
+        # --- Detector-assisted ROI (runs on full-res frame BEFORE downsampling) ---
+        det_info: FrameDetectorInfo | None = None
+        roi_xyxy: tuple[int, int, int, int] | None = None
+        if detector_state is not None:
+            det_info = detector_state.step(
+                frame_bgr=frame,
+                frame_idx=idx,
+                tracking_conf=last_tracking_conf,
+                has_centroid=last_has_centroid,
+            )
+            roi_xyxy = det_info.roi_xyxy
+
         # Downsample frame if downsampling is enabled
         if downsample_factor is not None:
             frame = _downsample_frame(frame, downsample_factor)
+            # Scale ROI to downsampled space
+            if roi_xyxy is not None:
+                roi_xyxy = (
+                    int(roi_xyxy[0] / downsample_factor),
+                    int(roi_xyxy[1] / downsample_factor),
+                    int(roi_xyxy[2] / downsample_factor),
+                    int(roi_xyxy[3] / downsample_factor),
+                )
 
         # Raw grayscale (original intensity — for candidate scoring)
         raw_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame.copy()
@@ -411,21 +489,97 @@ def _track_video(
                     )
             mask = cv2.bitwise_and(mask, motion_mask)
 
+        # --- Crop mask and gray to detector ROI (if available) ---
+        roi_offset_x = 0
+        roi_offset_y = 0
+        if roi_xyxy is not None:
+            rx1, ry1, rx2, ry2 = roi_xyxy
+            # Ensure valid crop region
+            if rx2 > rx1 and ry2 > ry1:
+                mask = mask[ry1:ry2, rx1:rx2]
+                raw_gray = raw_gray[ry1:ry2, rx1:rx2]
+                roi_offset_x = rx1
+                roi_offset_y = ry1
+
         # Kalman predict (before track_frame so gating uses the prediction)
+        # Adjust Kalman prediction to ROI space if we have a detector ROI
         if kalman is not None and kalman.initialized:
             kalman.predict()
 
+        # When using ROI, adjust 'previous' to ROI-local coordinates for tracking
+        roi_previous = previous
+        if roi_xyxy is not None and previous is not None and previous.x is not None and previous.y is not None:
+            roi_previous = TrackPoint(
+                frame_idx=previous.frame_idx,
+                x=previous.x - roi_offset_x,
+                y=previous.y - roi_offset_y,
+                area=previous.area,
+                confidence=previous.confidence,
+                flags=previous.flags,
+            )
+
+        if debug_frames_dir is not None:
+            debug_sink.clear()
         point = track_frame(
             mask,
             frame_idx=idx,
             tracking=effective_config.tracking,
-            previous=previous,
+            previous=roi_previous,
             ambiguity_confidence=effective_config.ambiguity_confidence,
             shadow_confidence=effective_config.shadow_confidence,
             gray_frame=raw_gray,
-            kalman=kalman,
+            kalman=kalman if roi_xyxy is None else None,  # skip Kalman gating inside ROI
             adaptive_area=area_filter,
+            debug_sink=debug_sink if debug_frames_dir is not None else None,
         )
+
+        # Convert ROI-local coords back to global (processing-resolution)
+        if roi_xyxy is not None and point.x is not None and point.y is not None:
+            point = TrackPoint(
+                frame_idx=point.frame_idx,
+                x=point.x + roi_offset_x,
+                y=point.y + roi_offset_y,
+                area=point.area,
+                confidence=point.confidence,
+                flags=point.flags,
+            )
+
+        if (
+            debug_frames_dir is not None
+            and debug_sink
+            and (idx % debug_frame_interval == 0)
+            and (debug_max_frames is None or debug_frames_written < debug_max_frames)
+        ):
+            debug_img = render_debug_frame(frame, mask, debug_sink[-1])
+            out_path = debug_frames_dir / f"frame_{idx:06d}.png"
+            if cv2.imwrite(str(out_path), debug_img):
+                debug_frames_written += 1
+
+        # --- Adjust confidence based on detector state ---
+        if detector_state is not None and point.x is not None:
+            extra_flags = list(point.flags)
+            conf = point.confidence
+            if det_info is not None and det_info.detector_used:
+                if det_info.detector_score is not None and det_info.detector_score >= config.detector.min_score:
+                    pass  # fresh, good detection: keep full confidence
+                elif det_info.detector_score is not None and det_info.detector_score < config.detector.min_score:
+                    conf *= 0.85
+                    if "DETECTOR_LOW_SCORE" not in extra_flags:
+                        extra_flags.append("DETECTOR_LOW_SCORE")
+            elif detector_state.frames_since_detect > config.detector.every_n_frames * 2:
+                conf *= 0.85
+                if "DETECTOR_STALE_ROI" not in extra_flags:
+                    extra_flags.append("DETECTOR_STALE_ROI")
+
+            if extra_flags != point.flags or conf != point.confidence:
+                point = TrackPoint(
+                    frame_idx=point.frame_idx,
+                    x=point.x,
+                    y=point.y,
+                    area=point.area,
+                    confidence=conf,
+                    flags=extra_flags,
+                )
 
         # --- Update Kalman / adaptive area in processing space -----------
         if point.x is not None and point.y is not None:
@@ -508,13 +662,19 @@ def _track_video(
                         flags=point.flags,
                     )
         points.append(point)
+        if det_infos is not None:
+            det_infos.append(det_info if det_info is not None else FrameDetectorInfo())
+
+        # Update tracking state for detector scheduling
+        last_tracking_conf = point.confidence
+        last_has_centroid = point.x is not None and point.y is not None
 
         if progress_callback and (idx + 1) % config.progress_interval == 0:
             progress_callback(idx + 1, total)
 
     if progress_callback:
         progress_callback(total, total)
-    return points
+    return points, det_infos
 
 
 def _update_ema(
@@ -988,12 +1148,14 @@ def _track_video_parallel(
     # MOG2 background is stateful — force sequential processing
     if background is not None and background.mog2_subtractor is not None:
         with VideoReader(video_path) as reader:
-            return _track_video(reader, config, background, progress_callback, arena_mask=arena_mask)
+            pts, _ = _track_video(reader, config, background, progress_callback, arena_mask=arena_mask)
+            return pts
 
     # Use sequential processing for small videos
     if total_frames <= chunk_size:
         with VideoReader(video_path) as reader:
-            return _track_video(reader, config, background, progress_callback, arena_mask=arena_mask)
+            pts, _ = _track_video(reader, config, background, progress_callback, arena_mask=arena_mask)
+            return pts
 
     # Determine number of workers
     if num_workers is None:
@@ -1076,7 +1238,8 @@ def _track_video_parallel(
                     if progress_callback:
                         progress_callback(0, total_frames)
                     with VideoReader(video_path) as reader:
-                        return _track_video(reader, config, background, progress_callback, arena_mask=arena_mask)
+                        pts, _ = _track_video(reader, config, background, progress_callback, arena_mask=arena_mask)
+                        return pts
 
             # Merge chunks in order
             for chunk_idx in sorted(chunk_results.keys()):
@@ -1098,26 +1261,45 @@ def _track_video_parallel(
     return all_points
 
 
-def _write_per_frame(path: Path, points: list[TrackPoint]) -> None:
+def _write_per_frame(
+    path: Path,
+    points: list[TrackPoint],
+    *,
+    det_infos: list[FrameDetectorInfo] | None = None,
+) -> None:
+    has_det = det_infos is not None and len(det_infos) == len(points)
     with path.open("w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(["frame", "x", "y", "area", "confidence", "flags"])
-        for point in points:
+        header = ["frame", "x", "y", "area", "confidence", "flags"]
+        if has_det:
+            header += ["roi_x1", "roi_y1", "roi_x2", "roi_y2", "detector_score", "detector_used"]
+        writer.writerow(header)
+        for i, point in enumerate(points):
             flags = ";".join(point.flags) if point.flags else ""
-            writer.writerow(
-                [
-                    point.frame_idx,
-                    "" if point.x is None else f"{point.x:.3f}",
-                    "" if point.y is None else f"{point.y:.3f}",
-                    "" if point.area is None else f"{point.area:.1f}",
-                    f"{point.confidence:.3f}",
-                    flags,
-                ]
-            )
+            row: list[str | int | float] = [
+                point.frame_idx,
+                "" if point.x is None else f"{point.x:.3f}",
+                "" if point.y is None else f"{point.y:.3f}",
+                "" if point.area is None else f"{point.area:.1f}",
+                f"{point.confidence:.3f}",
+                flags,
+            ]
+            if has_det and det_infos is not None:
+                di = det_infos[i]
+                if di.roi_xyxy is not None:
+                    row += [di.roi_xyxy[0], di.roi_xyxy[1], di.roi_xyxy[2], di.roi_xyxy[3]]
+                else:
+                    row += ["", "", "", ""]
+                row.append("" if di.detector_score is None else f"{di.detector_score:.4f}")
+                row.append("1" if di.detector_used else "0")
+            writer.writerow(row)
 
 
 def _summarize(
-    points: list[TrackPoint], config: TrackCentroidConfig
+    points: list[TrackPoint],
+    config: TrackCentroidConfig,
+    *,
+    det_infos: list[FrameDetectorInfo] | None = None,
 ) -> dict[str, float]:
     total = len(points)
     tracked = [p for p in points if p.x is not None and p.y is not None]
@@ -1126,11 +1308,21 @@ def _summarize(
         float(np.mean([p.confidence for p in tracked])) if tracked else 0.0
     )
     jump_rate = _jump_rate(tracked, config)
-    return {
+    summary: dict[str, float] = {
         "coverage": float(coverage),
         "mean_conf": float(mean_conf),
         "jump_rate": float(jump_rate),
     }
+
+    # Detector metrics
+    if det_infos is not None and len(det_infos) > 0:
+        det_used = [d for d in det_infos if d.detector_used]
+        det_scores = [d.detector_score for d in det_used if d.detector_score is not None]
+        det_with_roi = [d for d in det_infos if d.roi_xyxy is not None]
+        summary["detector_coverage"] = float(len(det_with_roi) / len(det_infos)) if det_infos else 0.0
+        summary["detector_mean_score"] = float(np.mean(det_scores)) if det_scores else 0.0
+
+    return summary
 
 
 def _jump_rate(
@@ -1154,6 +1346,40 @@ def _jump_rate(
             total += 1
         prev = point
     return (jumps / total) if total > 0 else 0.0
+
+
+def _write_detector_debug_frames(
+    video_path: Path,
+    det_infos: list[FrameDetectorInfo],
+    points: list[TrackPoint],
+    out_dir: Path,
+    max_frames: int = 10,
+) -> None:
+    """Write sampled frames with detector bbox overlay to *out_dir*."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Pick evenly-spaced frames that had a detector ROI
+    candidates = [
+        i for i, di in enumerate(det_infos) if di.roi_xyxy is not None
+    ]
+    if not candidates:
+        return
+
+    step = max(1, len(candidates) // max_frames)
+    selected = candidates[::step][:max_frames]
+
+    with VideoReader(video_path) as reader:
+        for idx, frame in reader.iter_frames():
+            if idx not in selected:
+                continue
+            di = det_infos[idx]
+            if di.roi_xyxy is not None:
+                x1, y1, x2, y2 = di.roi_xyxy
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            pt = points[idx] if idx < len(points) else None
+            if pt is not None and pt.x is not None and pt.y is not None:
+                cv2.circle(frame, (int(pt.x), int(pt.y)), 5, (0, 0, 255), -1)
+            cv2.imwrite(str(out_dir / f"det_frame_{idx:06d}.png"), frame)
 
 
 def _resolve_visualization_options(

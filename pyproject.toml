@@ -26,6 +26,10 @@ dev = [
     "twine>=6.2",
     "jsonschema>=4",
 ]
+detector = [
+    "onnxruntime>=1.17",
+    "numpy>=1.26",
+]
 
 [project.scripts]
 scindra-engine = "scindra_engine.__main__:app"
@@ -45,3 +49,6 @@ strict = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "detector_optional: requires onnxruntime (optional detector dependency)",
+]

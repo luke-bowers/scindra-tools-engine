@@ -35,6 +35,16 @@ class Candidate:
     mean_intensity: float = 128.0  # default for backwards compat
 
 
+@dataclass(frozen=True)
+class TrackFrameDebug:
+    """Per-frame debug data: all candidates, excluded with reason, plausible, selected."""
+
+    all_candidates: tuple[Candidate, ...]
+    excluded: tuple[tuple[Candidate, str], ...]  # (candidate, reason): "area_low" | "area_high" | "spatial"
+    plausible: tuple[Candidate, ...]
+    selected: Candidate | None
+
+
 # ---------------------------------------------------------------------------
 # Adaptive area filter  (P2)
 # ---------------------------------------------------------------------------
@@ -80,6 +90,7 @@ def track_frame(
     gray_frame: np.ndarray | None = None,
     kalman: object | None = None,
     adaptive_area: AdaptiveAreaFilter | None = None,
+    debug_sink: list[TrackFrameDebug] | None = None,
 ) -> TrackPoint:
     """Detect candidates in *mask* and select the best one.
 
@@ -94,17 +105,43 @@ def track_frame(
     * *adaptive_area* – an ``AdaptiveAreaFilter``.  When provided and
       initialised, the area acceptance window is narrowed to track the
       running median of recent detections.
+    * *debug_sink* – when not None, one ``TrackFrameDebug`` is appended
+      per frame with all_candidates, excluded (with reason), plausible, selected.
     """
     candidates = _find_candidates(mask, gray_frame=gray_frame)
-    plausible = _filter_plausible(
-        candidates,
-        tracking,
-        previous,
-        kalman=kalman,
-        adaptive_area=adaptive_area,
-    )
+
+    if debug_sink is not None:
+        plausible, excluded_with_reason = _filter_plausible_with_reasons(
+            candidates,
+            tracking,
+            previous,
+            kalman=kalman,
+            adaptive_area=adaptive_area,
+        )
+    else:
+        plausible = _filter_plausible(
+            candidates,
+            tracking,
+            previous,
+            kalman=kalman,
+            adaptive_area=adaptive_area,
+        )
+        excluded_with_reason = []
+
+    if debug_sink is not None:
+        debug_sink.append(
+            TrackFrameDebug(
+                all_candidates=tuple(candidates),
+                excluded=tuple(excluded_with_reason),
+                plausible=tuple(plausible),
+                selected=None,  # set below if plausible
+            )
+        )
 
     if not plausible:
+        if debug_sink is not None and debug_sink:
+            # Replace last entry with selected=None (already correct)
+            pass
         return TrackPoint(
             frame_idx=frame_idx,
             x=None,
@@ -118,6 +155,14 @@ def track_frame(
     selected = _select_candidate(
         plausible, tracking, previous, kalman=kalman,
     )
+
+    if debug_sink is not None and debug_sink:
+        debug_sink[-1] = TrackFrameDebug(
+            all_candidates=debug_sink[-1].all_candidates,
+            excluded=debug_sink[-1].excluded,
+            plausible=debug_sink[-1].plausible,
+            selected=selected,
+        )
 
     flags: list[str] = []
     confidence = 0.9
@@ -220,34 +265,52 @@ def _filter_plausible(
     kalman: object | None = None,
     adaptive_area: AdaptiveAreaFilter | None = None,
 ) -> list[Candidate]:
-    # Resolve area bounds ------------------------------------------------
+    plausible, _ = _filter_plausible_with_reasons(
+        candidates, tracking, previous,
+        kalman=kalman, adaptive_area=adaptive_area,
+    )
+    return plausible
+
+
+def _filter_plausible_with_reasons(
+    candidates: list[Candidate],
+    tracking: TrackingConfig,
+    previous: TrackPoint | None,
+    *,
+    kalman: object | None = None,
+    adaptive_area: AdaptiveAreaFilter | None = None,
+) -> tuple[list[Candidate], list[tuple[Candidate, str]]]:
+    """Return (plausible, excluded_with_reason). Reason is 'area_low' | 'area_high' | 'spatial'."""
     area_lo: float = float(tracking.min_area_px)
     area_hi: float = float(tracking.max_area_px)
 
     if adaptive_area is not None:
         bounds = adaptive_area.get_bounds()
         if bounds is not None:
-            # Tighten the window (never loosen beyond config limits)
             area_lo = max(area_lo, bounds[0])
             area_hi = min(area_hi, bounds[1])
 
-    filtered: list[Candidate] = []
-    for candidate in candidates:
-        # Area gate
-        if candidate.area < area_lo or candidate.area > area_hi:
-            continue
+    plausible: list[Candidate] = []
+    excluded: list[tuple[Candidate, str]] = []
 
-        # Spatial gate: prefer Kalman, fall back to max_jump_px
+    for candidate in candidates:
+        if candidate.area < area_lo:
+            excluded.append((candidate, "area_low"))
+            continue
+        if candidate.area > area_hi:
+            excluded.append((candidate, "area_high"))
+            continue
         if kalman is not None and getattr(kalman, "initialized", False):
             if not kalman.is_within_gate(*candidate.centroid):  # type: ignore[union-attr]
+                excluded.append((candidate, "spatial"))
                 continue
         elif previous is not None and previous.x is not None and previous.y is not None:
             dist = _distance(candidate.centroid, (previous.x, previous.y))
             if dist > tracking.max_jump_px:
+                excluded.append((candidate, "spatial"))
                 continue
-
-        filtered.append(candidate)
-    return filtered
+        plausible.append(candidate)
+    return plausible, excluded
 
 
 # ---------------------------------------------------------------------------
