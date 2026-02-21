@@ -48,7 +48,7 @@ def test_preprocess_value_range() -> None:
     frame = _make_synthetic_frame(120, 160)
     tensor, _, _ = preprocess_frame(frame, (640, 640))
     assert tensor.min() >= 0.0
-    assert tensor.max() <= 1.0
+    assert tensor.max() <= 255.0
 
 
 def test_preprocess_determinism() -> None:
@@ -67,8 +67,8 @@ def test_preprocess_rgb_conversion() -> None:
     frame = np.zeros((4, 4, 3), dtype=np.uint8)
     frame[:, :, 2] = 255  # Red channel in BGR
     tensor, _, _ = preprocess_frame(frame, (4, 4))
-    # After BGR->RGB, channel 0 should be R (255/255=1.0)
+    # After BGR->RGB, channel 0 should be R (255.0 in 0-255 range)
     # Channel 2 should be B (0)
     # The frame is tiny so no padding needed
-    assert tensor[0, 0, 0, 0] == pytest.approx(1.0, abs=1e-6)  # R
+    assert tensor[0, 0, 0, 0] == pytest.approx(255.0, abs=1e-6)  # R
     assert tensor[0, 2, 0, 0] == pytest.approx(0.0, abs=1e-6)  # B

@@ -68,6 +68,99 @@ An optional `.json` sidecar (same name as the `.onnx` file) can specify model
 metadata (input size, score threshold, NMS IoU, class names). If absent, safe
 defaults are used.
 
+### Training a mouse detector
+
+You can train a YOLOX-Nano mouse detector from the [Kumar Lab Single Mouse Tracking Annotated Dataset](https://www.kumarlab.org/2019/02/12/single-mouse-tracking-annotated-dataset/) (OFA_Dataset). Training uses a **separate** Python environment (YOLOX and its dependencies are not in the main project).
+
+#### 1. Get the dataset
+
+- Download **OFA_Dataset** (e.g. from [Zenodo](https://zenodo.org/record/5806397) or the Kumar Lab FTP; use an FTP client like FileZilla if the link is `ftp://`).
+- Extract it so you have a folder containing `Ref/` (images) and `Ell/` (ellipse-fit `.txt` annotations). Example: `inputs/OFA_Dataset/` or `C:\datasets\OFA_Dataset`.
+
+#### 2. Create the training environment
+
+YOLOX is not in `pyproject.toml`. Create a dedicated venv and install YOLOX plus dependencies:
+
+```powershell
+# Windows (PowerShell) – from repo root
+python -m venv .venv-train
+.\.venv-train\Scripts\Activate.ps1
+pip install --upgrade pip
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+pip install opencv-python pycocotools loguru tqdm pyyaml tabulate
+pip install --no-deps "git+https://github.com/Megvii-BaseDetection/YOLOX.git"
+```
+
+On Linux/macOS, use `source .venv-train/bin/activate` and the same `pip install` lines. If you don’t have CUDA, omit the PyTorch index URL and install default `torch`/`torchvision`.
+
+**Optional:** On Windows, YOLOX’s COCO evaluation may try to load a C++ extension that needs ninja. The experiment file `scripts/yolox_mouse_exp.py` patches the evaluator to use standard `pycocotools` COCOeval so training works without ninja.
+
+#### 3. Run the training pipeline
+
+The script **converts** the Kumar dataset to COCO, **trains** YOLOX-Nano, and **exports** the best checkpoint to ONNX. It must be run with the **training** venv active (so `python` is the one that has `yolox`).
+
+**Windows (PowerShell):**
+
+```powershell
+.\.venv-train\Scripts\Activate.ps1
+.\scripts\train_yolox_mouse.ps1 -DatasetDir "inputs\OFA_Dataset"
+```
+
+**Linux/macOS (bash):** There is no `train_yolox_mouse.sh`. Run the same steps manually:
+
+```bash
+source .venv-train/bin/activate
+export YOLOX_DATA_DIR=datasets/kumar_mouse_coco
+export YOLOX_OUTPUT_DIR=YOLOX_outputs
+
+# Convert
+python scripts/convert_kumar_to_coco.py --dataset-dir inputs/OFA_Dataset --out-dir datasets/kumar_mouse_coco
+
+# Download pretrained weights (once)
+mkdir -p weights
+# Download yolox_nano.pth from https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_nano.pth into weights/
+
+# Train (80 epochs, batch 16, 1 GPU; max_epoch is in scripts/yolox_mouse_exp.py)
+python -m yolox.tools.train -f scripts/yolox_mouse_exp.py -d 1 -b 16 --fp16 -c weights/yolox_nano.pth
+
+# Export best checkpoint to ONNX
+python scripts/export_yolox_onnx.py -f scripts/yolox_mouse_exp.py -c YOLOX_outputs/yolox_mouse_nano/best_ckpt.pth --out models/yolox_mouse_640.onnx
+```
+
+**Optional parameters (PowerShell):** `-OutputDir`, `-ModelDir`, `-Epochs` (display only; actual `max_epoch` is in `yolox_mouse_exp.py`), `-BatchSize`, `-GPUs`.
+
+#### 4. Verify labels (optional)
+
+After conversion, you can check that bounding boxes match the mice before training:
+
+```bash
+python scripts/verify_training_labels.py
+```
+
+Images are written to `out/verify_labels/`. If boxes are misaligned, fix the conversion (see `scripts/convert_kumar_to_coco.py` and the ellipse file format).
+
+#### 5. Use the trained model
+
+The pipeline writes:
+
+- **ONNX:** `models/yolox_mouse_640.onnx` (and `models/yolox_mouse_640.json` if generated).
+- **Checkpoints:** `YOLOX_outputs/yolox_mouse_nano/` (e.g. `best_ckpt.pth`, `last_epoch_ckpt.pth`).
+
+Use the ONNX model with the engine:
+
+```bash
+scindra-engine track-centroid --video your_video.mp4 --out out/ --detector --detector-model models/yolox_mouse_640.onnx
+# or
+export SCINDRA_YOLOX_ONNX_PATH=models/yolox_mouse_640.onnx
+scindra-engine track-centroid --video your_video.mp4 --out out/ --detector
+```
+
+For a quick visual check of detections only:
+
+```bash
+scindra-engine detect-mouse --video your_video.mp4 --out out/detections --model models/yolox_mouse_640.onnx
+```
+
 ## Smoke tests
 
 The `smoke_latest` script provides an adaptive smoke test that detects available CLI capabilities and exercises the most end-to-end path available. It uses CLI commands exclusively and produces artifacts in `out/smoke_latest/<timestamp>/`.

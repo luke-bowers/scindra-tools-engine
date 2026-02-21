@@ -52,7 +52,10 @@ def preprocess_frame(
     frame_bgr: np.ndarray,
     input_size: tuple[int, int],
 ) -> tuple[np.ndarray, float, tuple[int, int]]:
-    """Full preprocessing pipeline: letterbox, BGR->RGB, HWC->CHW, float32 /255.
+    """Full preprocessing pipeline: letterbox, BGR->RGB, HWC->CHW, float32.
+
+    YOLOX expects pixel values in the **0-255** float32 range (no /255
+    normalisation).  This matches the standard YOLOX training pipeline.
 
     Args:
         frame_bgr: Input frame in BGR ``uint8``.
@@ -70,8 +73,8 @@ def preprocess_frame(
     # HWC -> CHW
     chw = rgb.transpose(2, 0, 1)
 
-    # float32, normalise 0..1
-    tensor = chw.astype(np.float32) / 255.0
+    # float32 -- keep 0..255 range (YOLOX convention, no /255 normalisation)
+    tensor = chw.astype(np.float32)
 
     # Add batch dimension
     return np.expand_dims(tensor, axis=0), scale, pad

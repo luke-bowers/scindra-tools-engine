@@ -1,6 +1,7 @@
 # Virtual environments
 .venv/
 venv/
+.venv-train/
 env/
 .smoke_venv/
 
@@ -25,3 +26,11 @@ inputs/
 out/
 test_config.json
 invalid_config.json
+
+# Model weights and training artifacts
+models/
+weights/
+datasets/
+YOLOX_outputs/
+*.onnx
+*.pth
