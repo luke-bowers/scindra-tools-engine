@@ -161,6 +161,31 @@ For a quick visual check of detections only:
 scindra-engine detect-mouse --video your_video.mp4 --out out/detections --model models/yolox_mouse_640.onnx
 ```
 
+#### 6. Fine-tune on your own data (e.g. CVAT export)
+
+To add another arena or dataset (e.g. CVAT-exported bounding boxes), prepare it into YOLOX layout then fine-tune from your best Kumar checkpoint:
+
+**Step 1 – Prepare the CVAT export**
+
+Extract the CVAT zip so you have `annotations/instances_default.json` and an `images/` folder. Then:
+
+```powershell
+python scripts/prepare_cvat_coco.py --cvat-export inputs/EZM_Dataset --out-dir datasets/ezm_coco
+```
+
+This splits the data into train/val (default 85/15), writes `datasets/ezm_coco/annotations/train.json` and `val.json`, and copies images into `images/train/` and `images/val/`. Use `--symlink` to link instead of copy.
+
+**Step 2 – Fine-tune from the Kumar checkpoint**
+
+Activate the training venv and run the finetune script with the prepared dataset and your best checkpoint:
+
+```powershell
+.\.venv-train\Scripts\Activate.ps1
+.\scripts\train_yolox_finetune.ps1 -CocoDir "datasets\ezm_coco" -Checkpoint "YOLOX_outputs\yolox_mouse_nano\best_ckpt.pth"
+```
+
+Training and ONNX export use the same defaults as the full pipeline; the new ONNX is written to `models/yolox_mouse_640.onnx` (overwriting the previous one unless you change `--ModelDir` or copy the file first).
+
 ## Smoke tests
 
 The `smoke_latest` script provides an adaptive smoke test that detects available CLI capabilities and exercises the most end-to-end path available. It uses CLI commands exclusively and produces artifacts in `out/smoke_latest/<timestamp>/`.
