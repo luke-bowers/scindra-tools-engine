@@ -354,15 +354,27 @@ class DetectorConfig(BaseModel):
     )
     roi_padding_px: int = Field(
         default=60, ge=0,
-        description="Pixels to pad around the detector bounding box for the ROI.",
+        description="Pixels to pad around the detector bounding box for the ROI (used when roi_padding_ratio is not set).",
+    )
+    roi_padding_ratio: float | None = Field(
+        default=None, ge=0.0,
+        description="Padding as fraction of bbox size: padding on each side = ratio * min(bbox_width, bbox_height). When set, overrides roi_padding_px. E.g. 0.5 = 50%% of smaller dimension.",
     )
     roi_padding_scale: float | None = Field(
         default=None, ge=1.0,
-        description="Alternative: scale factor for ROI around bbox (e.g. 1.5x).",
+        description="Alternative: scale factor for ROI around bbox (e.g. 1.5x). Takes precedence over roi_padding_ratio/roi_padding_px when set.",
     )
     max_roi_jump_px: float = Field(
         default=200.0, ge=0.0,
-        description="Max allowed jump in ROI center; larger triggers hysteresis.",
+        description="Max allowed jump in ROI center (pixels); larger triggers hysteresis. Used when max_roi_jump_ratio is not set.",
+    )
+    max_roi_jump_ratio: float | None = Field(
+        default=None, ge=0.0,
+        description="Max allowed jump as fraction of bbox size: threshold = ratio * max(bbox_width, bbox_height). When set, overrides max_roi_jump_px for scale-invariant behavior.",
+    )
+    precompute_roi_parallel: bool = Field(
+        default=False,
+        description="When True, run detector in a pre-pass to build a per-frame ROI schedule, then use parallel chunked tracking with those ROIs.",
     )
     fallback_to_classical_full_frame: bool = Field(
         default=True,

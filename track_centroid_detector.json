@@ -1,0 +1,16 @@
+{
+  "downsample_factor": 2.0,
+  "detector": {
+    "enabled": true,
+    "model_path": "models/yolox_mouse_640.onnx",
+    "min_score": 0.25,
+    "every_n_frames": 20,
+    "reacquire_on_low_tracking_conf": true,
+    "roi_padding_ratio": 0.5,
+    "max_roi_jump_ratio": 1.0,
+    "fallback_to_classical_full_frame": true,
+    "write_detector_debug_frames": false,
+    "detector_debug_frame_count": 15,
+    "precompute_roi_parallel": true
+  }
+}

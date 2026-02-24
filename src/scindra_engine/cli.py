@@ -312,6 +312,18 @@ def track_centroid(
         min=0,
         help="Pixels to pad around the detector bounding box for the ROI (default: 60).",
     ),
+    roi_padding_ratio: float | None = typer.Option(
+        None,
+        "--roi-padding-ratio",
+        min=0.0,
+        help="Padding as fraction of bbox size (e.g. 0.5 = 50%% of smaller dimension). Overrides roi_padding_px when set.",
+    ),
+    max_roi_jump_ratio: float | None = typer.Option(
+        None,
+        "--max-roi-jump-ratio",
+        min=0.0,
+        help="Max ROI center jump as fraction of bbox size. Overrides max_roi_jump_px when set.",
+    ),
 ) -> None:
     """Track a centroid using the classical backend."""
     try:
@@ -350,6 +362,10 @@ def track_centroid(
                 det_overrides["min_score"] = detector_min_score
             if roi_padding_px is not None:
                 det_overrides["roi_padding_px"] = roi_padding_px
+            if roi_padding_ratio is not None:
+                det_overrides["roi_padding_ratio"] = roi_padding_ratio
+            if max_roi_jump_ratio is not None:
+                det_overrides["max_roi_jump_ratio"] = max_roi_jump_ratio
             new_det_cfg = config.detector.model_copy(update=det_overrides)
             config = config.model_copy(update={"detector": new_det_cfg})
 

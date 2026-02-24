@@ -97,11 +97,17 @@ def run_track_centroid(
         debug_frames_dir = run_dir / "debug_frames"
         debug_frames_dir.mkdir(parents=True, exist_ok=True)
 
-    # Detector-assisted tracking is inherently sequential (stateful)
-    force_sequential = detector_state is not None
+    # Optional: precompute detector ROIs to enable parallel tracking
+    use_precompute_parallel = (
+        detector_state is not None
+        and getattr(config.detector, "precompute_roi_parallel", False)
+        and debug_frames_dir is None
+    )
 
-    if debug_frames_dir is not None or force_sequential:
-        # Sequential: required for debug frames or detector-assisted mode
+    det_infos: list[FrameDetectorInfo] | None = None
+
+    if debug_frames_dir is not None or (detector_state is not None and not use_precompute_parallel):
+        # Sequential: required for debug frames or (by default) detector-assisted mode
         with VideoReader(video_path) as reader:
             points, det_infos = _track_video(
                 reader,
@@ -115,8 +121,14 @@ def run_track_centroid(
                 detector_state=detector_state,
             )
     else:
+        # Parallel processing (classical-only, or detector with precomputed ROIs)
         effective_workers = parallel_workers if parallel_workers is not None else config.parallel_workers
         effective_chunk_size = chunk_size if chunk_size is not None else config.chunk_size
+
+        # When using detector-assisted parallel mode, first build a per-frame ROI schedule
+        if use_precompute_parallel and detector_state is not None:
+            det_infos = _precompute_detector_infos(video_path, detector_state)
+
         try:
             points = _track_video_parallel(
                 video_path,
@@ -126,11 +138,19 @@ def run_track_centroid(
                 num_workers=effective_workers,
                 chunk_size=effective_chunk_size,
                 arena_mask=arena_mask,
+                det_infos=det_infos,
             )
         except Exception:
+            # Fallback to sequential processing on error
             with VideoReader(video_path) as reader:
-                points, _ = _track_video(reader, config, background, progress_callback, arena_mask=arena_mask)
-        det_infos = None
+                points, det_infos = _track_video(
+                    reader,
+                    config,
+                    background,
+                    progress_callback,
+                    arena_mask=arena_mask,
+                    detector_state=detector_state,
+                )
 
     # Post-processing: key-frame interpolation
     if config.key_frame_interpolation.enabled:
@@ -284,6 +304,29 @@ def _build_background(
         frames = [_downsample_frame(frame, config.downsample_factor) for frame in frames]
     
     return build_background(frames, config.preprocessing)
+
+
+def _precompute_detector_infos(
+    video_path: Path,
+    detector_state: DetectorState,
+) -> list[FrameDetectorInfo]:
+    """Run the detector in a pre-pass to build a per-frame ROI schedule.
+
+    This pass is lightweight compared to full tracking (no preprocessing or
+    segmentation), and it enables parallel chunked tracking to use a
+    detector-guided ROI without invoking the detector inside each worker.
+    """
+    det_infos: list[FrameDetectorInfo] = []
+    with VideoReader(video_path) as reader:
+        for idx, frame in reader.iter_frames():
+            info = detector_state.step(
+                frame_bgr=frame,
+                frame_idx=idx,
+                tracking_conf=1.0,
+                has_centroid=True,
+            )
+            det_infos.append(info)
+    return det_infos
 
 
 def _load_or_build_arena_mask(
@@ -704,6 +747,7 @@ def _process_chunk(
     progress_tracker: ThreadSafeProgressTracker | None = None,
     progress_interval: int = 10,
     arena_mask: np.ndarray | None = None,
+    det_infos: list[FrameDetectorInfo] | None = None,
 ) -> list[TrackPoint]:
     """Process a chunk of frames from a video.
 
@@ -777,9 +821,22 @@ def _process_chunk(
     with VideoReader(video_path) as reader:
         frame_count = 0
         for idx, frame in reader.iter_frames(start_frame=chunk_start, end_frame=chunk_end):
+            # Optional detector ROI (full-resolution coords from pre-pass)
+            roi_xyxy: tuple[int, int, int, int] | None = None
+            if det_infos is not None and idx < len(det_infos):
+                roi_xyxy = det_infos[idx].roi_xyxy
+
             # Downsample frame if downsampling is enabled
             if downsample_factor is not None:
                 frame = _downsample_frame(frame, downsample_factor)
+                # Scale ROI to downsampled space
+                if roi_xyxy is not None:
+                    roi_xyxy = (
+                        int(roi_xyxy[0] / downsample_factor),
+                        int(roi_xyxy[1] / downsample_factor),
+                        int(roi_xyxy[2] / downsample_factor),
+                        int(roi_xyxy[3] / downsample_factor),
+                    )
 
             # Raw grayscale (original intensity — for candidate scoring)
             raw_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame.copy()
@@ -822,6 +879,18 @@ def _process_chunk(
                 chroma_mask = cv2.bitwise_or(chroma_ok, luma_ok)
                 mask = cv2.bitwise_and(mask, chroma_mask)
 
+            # --- Crop mask and gray to detector ROI (if available) ---
+            roi_offset_x = 0
+            roi_offset_y = 0
+            if roi_xyxy is not None:
+                rx1, ry1, rx2, ry2 = roi_xyxy
+                # Ensure valid crop region
+                if rx2 > rx1 and ry2 > ry1:
+                    mask = mask[ry1:ry2, rx1:rx2]
+                    raw_gray = raw_gray[ry1:ry2, rx1:rx2]
+                    roi_offset_x = rx1
+                    roi_offset_y = ry1
+
             # Apply motion mask — discard static foreground
             if motion is not None:
                 motion_mask = motion.update(gray)
@@ -841,17 +910,40 @@ def _process_chunk(
             if kalman is not None and kalman.initialized:
                 kalman.predict()
 
+            # When using ROI, adjust 'previous' to ROI-local coordinates for tracking
+            roi_previous = previous
+            if roi_xyxy is not None and previous is not None and previous.x is not None and previous.y is not None:
+                roi_previous = TrackPoint(
+                    frame_idx=previous.frame_idx,
+                    x=previous.x - roi_offset_x,
+                    y=previous.y - roi_offset_y,
+                    area=previous.area,
+                    confidence=previous.confidence,
+                    flags=previous.flags,
+                )
+
             point = track_frame(
                 mask,
                 frame_idx=idx,
                 tracking=effective_config.tracking,
-                previous=previous,
+                previous=roi_previous,
                 ambiguity_confidence=effective_config.ambiguity_confidence,
                 shadow_confidence=effective_config.shadow_confidence,
                 gray_frame=raw_gray,
-                kalman=kalman,
+                kalman=kalman if roi_xyxy is None else None,
                 adaptive_area=area_filter,
             )
+
+            # Convert ROI-local coords back to global (processing-resolution)
+            if roi_xyxy is not None and point.x is not None and point.y is not None:
+                point = TrackPoint(
+                    frame_idx=point.frame_idx,
+                    x=point.x + roi_offset_x,
+                    y=point.y + roi_offset_y,
+                    area=point.area,
+                    confidence=point.confidence,
+                    flags=point.flags,
+                )
 
             # --- Update Kalman / adaptive area in processing space -------
             if point.x is not None and point.y is not None:
@@ -1123,6 +1215,7 @@ def _track_video_parallel(
     num_workers: int | None = None,
     chunk_size: int = 200,
     arena_mask: np.ndarray | None = None,
+    det_infos: list[FrameDetectorInfo] | None = None,
 ) -> list[TrackPoint]:
     """Track video frames using parallel chunk processing.
 
@@ -1221,6 +1314,7 @@ def _track_video_parallel(
                     progress_tracker=progress_tracker,
                     progress_interval=progress_interval,
                     arena_mask=arena_mask,
+                    det_infos=det_infos,
                 )
                 future_to_chunk[future] = chunk_idx
 

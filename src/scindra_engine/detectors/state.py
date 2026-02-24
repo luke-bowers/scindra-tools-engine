@@ -142,14 +142,15 @@ class DetectorState:
 
             if self.last_bbox is not None:
                 jump = self._bbox_center_dist(self.last_bbox, new_bbox)
-                if jump > self._cfg.max_roi_jump_px:
+                jump_threshold = self._jump_threshold(self.last_bbox)
+                if jump > jump_threshold:
                     # Hysteresis: require 2 consecutive frames
                     if (
                         self._pending_jump_bbox is not None
                         and self._bbox_center_dist(
                             self._pending_jump_bbox, new_bbox
                         )
-                        < self._cfg.max_roi_jump_px
+                        < jump_threshold
                     ):
                         self._pending_jump_count += 1
                     else:
@@ -187,9 +188,9 @@ class DetectorState:
         x1, y1, x2, y2 = bbox
         fh, fw = frame_hw
 
+        bw = x2 - x1
+        bh = y2 - y1
         if self._cfg.roi_padding_scale is not None:
-            bw = x2 - x1
-            bh = y2 - y1
             cx = (x1 + x2) / 2.0
             cy = (y1 + y2) / 2.0
             new_bw = bw * self._cfg.roi_padding_scale
@@ -199,7 +200,10 @@ class DetectorState:
             x2 = int(cx + new_bw / 2.0)
             y2 = int(cy + new_bh / 2.0)
         else:
-            pad = self._cfg.roi_padding_px
+            if self._cfg.roi_padding_ratio is not None:
+                pad = int(self._cfg.roi_padding_ratio * min(bw, bh))
+            else:
+                pad = self._cfg.roi_padding_px
             x1 -= pad
             y1 -= pad
             x2 += pad
@@ -212,6 +216,14 @@ class DetectorState:
         y2 = min(fh, y2)
 
         return (x1, y1, x2, y2)
+
+    def _jump_threshold(self, bbox: tuple[int, int, int, int]) -> float:
+        """Return the max allowed ROI center jump in pixels (from config or ratio of bbox)."""
+        if self._cfg.max_roi_jump_ratio is not None:
+            bw = bbox[2] - bbox[0]
+            bh = bbox[3] - bbox[1]
+            return self._cfg.max_roi_jump_ratio * max(bw, bh)
+        return self._cfg.max_roi_jump_px
 
     @staticmethod
     def _bbox_center_dist(
