@@ -155,7 +155,7 @@
     "MorphologyConfig": {
       "properties": {
         "close_ksize": {
-          "default": 3,
+          "default": 7,
           "title": "Close Ksize",
           "type": "integer"
         },
@@ -170,7 +170,7 @@
           "type": "integer"
         },
         "open_ksize": {
-          "default": 3,
+          "default": 5,
           "title": "Open Ksize",
           "type": "integer"
         }
@@ -214,7 +214,8 @@
           "default": "median_n",
           "enum": [
             "none",
-            "median_n"
+            "median_n",
+            "mog2"
           ],
           "title": "Background Model",
           "type": "string"
@@ -270,6 +271,26 @@
           ],
           "title": "Illumination Correction",
           "type": "string"
+        },
+        "mog2_detect_shadows": {
+          "default": true,
+          "description": "MOG2 shadow detection.",
+          "title": "Mog2 Detect Shadows",
+          "type": "boolean"
+        },
+        "mog2_history": {
+          "default": 500,
+          "description": "MOG2 history length (frames).",
+          "minimum": 1,
+          "title": "Mog2 History",
+          "type": "integer"
+        },
+        "mog2_var_threshold": {
+          "default": 16.0,
+          "description": "MOG2 variance threshold.",
+          "minimum": 0.0,
+          "title": "Mog2 Var Threshold",
+          "type": "number"
         }
       },
       "title": "PreprocessingConfig",
@@ -343,9 +364,57 @@
     },
     "TrackingConfig": {
       "properties": {
+        "adaptive_area": {
+          "default": true,
+          "description": "Narrow the area filter around a running median of recent detections.",
+          "title": "Adaptive Area",
+          "type": "boolean"
+        },
+        "adaptive_area_history": {
+          "default": 30,
+          "description": "Number of recent detections used for the running median.",
+          "minimum": 3,
+          "title": "Adaptive Area History",
+          "type": "integer"
+        },
+        "adaptive_area_ratio": {
+          "default": 3.0,
+          "description": "Allowed area range: [median / ratio, median * ratio].",
+          "minimum": 1.0,
+          "title": "Adaptive Area Ratio",
+          "type": "number"
+        },
         "ema_alpha": {
           "default": 0.3,
           "title": "Ema Alpha",
+          "type": "number"
+        },
+        "kalman_coast_frames": {
+          "default": 5,
+          "description": "Maximum consecutive frames to coast on Kalman prediction when no detection is found.  0 = disable coasting.",
+          "minimum": 0,
+          "title": "Kalman Coast Frames",
+          "type": "integer"
+        },
+        "kalman_gate_sigma": {
+          "default": 4.0,
+          "description": "Mahalanobis-distance gate in sigma units.",
+          "minimum": 0.0,
+          "title": "Kalman Gate Sigma",
+          "type": "number"
+        },
+        "kalman_measurement_noise": {
+          "default": 4.0,
+          "description": "Kalman measurement-noise covariance diagonal (pixel^2).",
+          "minimum": 0.0,
+          "title": "Kalman Measurement Noise",
+          "type": "number"
+        },
+        "kalman_process_noise": {
+          "default": 4.0,
+          "description": "Kalman process-noise covariance diagonal (pixel^2).",
+          "minimum": 0.0,
+          "title": "Kalman Process Noise",
           "type": "number"
         },
         "max_area_px": {
@@ -371,6 +440,12 @@
           ],
           "title": "Smoothing",
           "type": "string"
+        },
+        "use_kalman": {
+          "default": true,
+          "description": "Use a Kalman filter for prediction-based gating and scoring.",
+          "title": "Use Kalman",
+          "type": "boolean"
         }
       },
       "title": "TrackingConfig",

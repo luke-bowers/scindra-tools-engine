@@ -287,7 +287,8 @@ def _filter_plausible_with_reasons(
     if adaptive_area is not None:
         bounds = adaptive_area.get_bounds()
         if bounds is not None:
-            area_lo = max(area_lo, bounds[0])
+            # min_area_px is a hard floor: never let adaptive raise the minimum above it
+            area_lo = min(area_lo, max(area_lo, bounds[0]))
             area_hi = min(area_hi, bounds[1])
 
     plausible: list[Candidate] = []

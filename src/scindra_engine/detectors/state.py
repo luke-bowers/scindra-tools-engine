@@ -168,48 +168,55 @@ class DetectorState:
         frame_hw: tuple[int, int],
     ) -> None:
         """Update state from a DetectorResult, with jump hysteresis."""
-        if result.best is not None and result.best.score >= self._cfg.min_score:
-            new_bbox = result.best.bbox_xyxy
-            self.last_detection_score = result.best.score
+        if result.best is None or result.best.score < self._cfg.min_score:
+            self.frames_since_detect += 1
+            return
+        new_bbox = result.best.bbox_xyxy
+        # Reject oversized bboxes (e.g. spurious detections on black frames)
+        max_area = getattr(self._cfg, "max_detector_bbox_area_px", None)
+        if max_area is not None:
+            w = new_bbox[2] - new_bbox[0]
+            h = new_bbox[3] - new_bbox[1]
+            if w * h > max_area:
+                self.frames_since_detect += 1
+                return
+        self.last_detection_score = result.best.score
 
-            if self.last_bbox is not None:
-                jump = self._bbox_center_dist(self.last_bbox, new_bbox)
-                jump_threshold = self._jump_threshold(self.last_bbox)
-                if jump > jump_threshold:
-                    # Hysteresis: require 2 consecutive frames
-                    if (
-                        self._pending_jump_bbox is not None
-                        and self._bbox_center_dist(
-                            self._pending_jump_bbox, new_bbox
-                        )
-                        < jump_threshold
-                    ):
-                        self._pending_jump_count += 1
-                    else:
-                        self._pending_jump_bbox = new_bbox
-                        self._pending_jump_count = 1
-
-                    if self._pending_jump_count >= 2:
-                        # Accept the jump
-                        self.last_bbox = new_bbox
-                        self._pending_jump_bbox = None
-                        self._pending_jump_count = 0
-                    # else: keep old bbox, do not update
+        if self.last_bbox is not None:
+            jump = self._bbox_center_dist(self.last_bbox, new_bbox)
+            jump_threshold = self._jump_threshold(self.last_bbox)
+            if jump > jump_threshold:
+                # Hysteresis: require 2 consecutive frames
+                if (
+                    self._pending_jump_bbox is not None
+                    and self._bbox_center_dist(
+                        self._pending_jump_bbox, new_bbox
+                    )
+                    < jump_threshold
+                ):
+                    self._pending_jump_count += 1
                 else:
-                    # Normal update, no large jump
+                    self._pending_jump_bbox = new_bbox
+                    self._pending_jump_count = 1
+
+                if self._pending_jump_count >= 2:
+                    # Accept the jump
                     self.last_bbox = new_bbox
                     self._pending_jump_bbox = None
                     self._pending_jump_count = 0
+                # else: keep old bbox, do not update
             else:
-                # First detection – accept unconditionally
+                # Normal update, no large jump
                 self.last_bbox = new_bbox
                 self._pending_jump_bbox = None
                 self._pending_jump_count = 0
-
-            self.frames_since_detect = 0
         else:
-            # No good detection – do NOT clear last_bbox (keep stale ROI)
-            self.frames_since_detect += 1
+            # First detection – accept unconditionally
+            self.last_bbox = new_bbox
+            self._pending_jump_bbox = None
+            self._pending_jump_count = 0
+
+        self.frames_since_detect = 0
 
     def _padded_roi(
         self,

@@ -2,8 +2,8 @@
   "downsample_factor": 2,
   "tracking": {
     "kalman_coast_frames": 2,
-    "kalman_process_noise": 1.0,
-    "min_area_px": 120
+    "kalman_process_noise": 1,
+    "min_area_px": 5
   },
   "detector": {
     "enabled": true,
@@ -14,8 +14,13 @@
     "roi_padding_ratio": 0.5,
     "max_roi_jump_ratio": 1,
     "fallback_to_classical_full_frame": true,
-    "write_detector_debug_frames": false,
+    "write_detector_debug_frames": true,
     "detector_debug_frame_count": 15,
-    "precompute_roi_parallel": true
-  }
+    "precompute_roi_parallel": true,
+    "start_tracking_after_first_detection": true,
+    "max_detector_bbox_area_px": 50000
+  },
+  "debug_mode": true,
+  "debug_frame_interval": 30,
+  "debug_max_frames": 100
 }

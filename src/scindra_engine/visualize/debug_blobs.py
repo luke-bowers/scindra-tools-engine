@@ -12,11 +12,17 @@ def render_debug_frame(
     frame_bgr: np.ndarray,
     mask: np.ndarray,
     debug_info: TrackFrameDebug,
+    *,
+    roi_offset_x: int = 0,
+    roi_offset_y: int = 0,
 ) -> np.ndarray:
     """Draw blob overlays on the frame: green=selected, yellow=plausible, red=excluded (with reason).
 
     All drawing is at processing resolution (same as mask and frame). Returns a new BGR image
     with a faint mask overlay and color-coded blob rectangles plus a legend.
+
+    When mask is cropped to ROI, pass roi_offset_x/roi_offset_y so blob coords are drawn correctly
+    on the full frame.
     """
     out = frame_bgr.copy()
     if out.ndim == 2:
@@ -39,6 +45,7 @@ def render_debug_frame(
     for candidate in debug_info.all_candidates:
         x, y, w, h = candidate.bbox
         cx, cy = int(round(candidate.centroid[0])), int(round(candidate.centroid[1]))
+        x, y, cx, cy = x + roi_offset_x, y + roi_offset_y, cx + roi_offset_x, cy + roi_offset_y
         if selected is not None and id(candidate) == id(selected):
             color = (0, 255, 0)  # BGR green
             label = "sel"

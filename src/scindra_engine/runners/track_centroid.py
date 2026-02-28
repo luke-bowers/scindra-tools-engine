@@ -27,6 +27,7 @@ from scindra_engine.video_io import (
     FrameSampler,
     VideoReader,
     fix_video_display_aspect_ratio,
+    get_video_display_aspect_ratio,
     require_ffmpeg_available,
 )
 from scindra_engine.visualize import write_heatmap_png, write_overlay_video as _write_overlay_video
@@ -410,6 +411,7 @@ def run_track_centroid(
             points=points,
             out_dir=run_dir / "debug_frames",
             max_frames=config.detector.detector_debug_frame_count,
+            min_score=config.detector.min_score,
         )
 
     if global_progress is not None:
@@ -763,6 +765,13 @@ def _track_video(
     last_tracking_conf: float = 0.0
     last_has_centroid: bool = False
 
+    # Start after first detection: only emit non-null points once detector finds mouse
+    tracking_started: bool = False
+    if detector_state is not None and config.detector.start_tracking_after_first_detection:
+        tracking_started = False
+    else:
+        tracking_started = True  # no deferral when detector is off or option disabled
+
     for idx, frame in reader.iter_frames():
         # --- Detector-assisted ROI (runs on full-res frame BEFORE downsampling) ---
         det_info: FrameDetectorInfo | None = None
@@ -776,211 +785,293 @@ def _track_video(
             )
             roi_xyxy = det_info.roi_xyxy
 
-        # Downsample frame if downsampling is enabled
-        if downsample_factor is not None:
-            frame = _downsample_frame(frame, downsample_factor)
-            # Scale ROI to downsampled space
-            if roi_xyxy is not None:
-                roi_xyxy = (
-                    int(roi_xyxy[0] / downsample_factor),
-                    int(roi_xyxy[1] / downsample_factor),
-                    int(roi_xyxy[2] / downsample_factor),
-                    int(roi_xyxy[3] / downsample_factor),
-                )
-
-        # Raw grayscale (original intensity — for candidate scoring)
-        raw_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame.copy()
-
-        gray = preprocess_frame(frame, effective_config.preprocessing, background)
-        mask = segment_frame(gray, effective_config.segmentation, effective_config.morphology)
-
-        # Apply arena ROI mask — discard foreground outside the arena
-        if arena_mask is not None:
-            mask = cv2.bitwise_and(mask, arena_mask)
-
-        # Chrominance / luminance filter — suppress shadows while keeping
-        # objects that differ from the background in *either* colour or
-        # brightness.  A shadow has the same hue AND a small brightness
-        # change; a real object (the mouse) will differ in at least one.
-        if (
-            effective_config.chroma_filter.enabled
-            and background is not None
-            and background.image_bgr is not None
-            and frame.ndim == 3
-        ):
-            lab_f = cv2.cvtColor(frame, cv2.COLOR_BGR2Lab)
-            lab_bg = cv2.cvtColor(background.image_bgr, cv2.COLOR_BGR2Lab)
-            chroma_diff = cv2.max(
-                cv2.absdiff(lab_f[:, :, 1], lab_bg[:, :, 1]),
-                cv2.absdiff(lab_f[:, :, 2], lab_bg[:, :, 2]),
-            )
-            luma_diff = cv2.absdiff(lab_f[:, :, 0], lab_bg[:, :, 0])
-            # Keep pixel if chrominance differs OR luminance differs a lot
-            _, chroma_ok = cv2.threshold(
-                chroma_diff,
-                effective_config.chroma_filter.threshold,
-                255,
-                cv2.THRESH_BINARY,
-            )
-            _, luma_ok = cv2.threshold(
-                luma_diff,
-                effective_config.chroma_filter.luma_threshold,
-                255,
-                cv2.THRESH_BINARY,
-            )
-            chroma_mask = cv2.bitwise_or(chroma_ok, luma_ok)
-            mask = cv2.bitwise_and(mask, chroma_mask)
-
-        # Apply motion mask — discard static foreground
-        if motion is not None:
-            motion_mask = motion.update(gray)
-            # Kalman search window: allow detection near predicted position
-            # even when the mouse is stationary (motion mask would suppress it)
-            if kalman is not None and kalman.initialized:
-                pred = kalman.predicted_position
-                if pred is not None:
-                    r = int(kalman.search_radius())
-                    cv2.circle(
-                        motion_mask,
-                        (int(round(pred[0])), int(round(pred[1]))),
-                        r, 255, -1,
-                    )
-            mask = cv2.bitwise_and(mask, motion_mask)
-
-        # --- Crop mask and gray to detector ROI (if available) ---
-        roi_offset_x = 0
-        roi_offset_y = 0
-        if roi_xyxy is not None:
-            rx1, ry1, rx2, ry2 = roi_xyxy
-            # Ensure valid crop region
-            if rx2 > rx1 and ry2 > ry1:
-                mask = mask[ry1:ry2, rx1:rx2]
-                raw_gray = raw_gray[ry1:ry2, rx1:rx2]
-                roi_offset_x = rx1
-                roi_offset_y = ry1
-
-        # Kalman predict (before track_frame so gating uses the prediction)
-        # Adjust Kalman prediction to ROI space if we have a detector ROI
-        if kalman is not None and kalman.initialized:
-            kalman.predict()
-
-        # When using ROI, adjust 'previous' to ROI-local coordinates for tracking
-        roi_previous = previous
-        if roi_xyxy is not None and previous is not None and previous.x is not None and previous.y is not None:
-            roi_previous = TrackPoint(
-                frame_idx=previous.frame_idx,
-                x=previous.x - roi_offset_x,
-                y=previous.y - roi_offset_y,
-                area=previous.area,
-                confidence=previous.confidence,
-                flags=previous.flags,
-            )
-
-        if debug_frames_dir is not None:
-            debug_sink.clear()
-        point = track_frame(
-            mask,
-            frame_idx=idx,
-            tracking=effective_config.tracking,
-            previous=roi_previous,
-            ambiguity_confidence=effective_config.ambiguity_confidence,
-            shadow_confidence=effective_config.shadow_confidence,
-            gray_frame=raw_gray,
-            kalman=kalman if roi_xyxy is None else None,  # skip Kalman gating inside ROI
-            adaptive_area=area_filter,
-            debug_sink=debug_sink if debug_frames_dir is not None else None,
-        )
-
-        # Convert ROI-local coords back to global (processing-resolution)
-        if roi_xyxy is not None and point.x is not None and point.y is not None:
-            point = TrackPoint(
-                frame_idx=point.frame_idx,
-                x=point.x + roi_offset_x,
-                y=point.y + roi_offset_y,
-                area=point.area,
-                confidence=point.confidence,
-                flags=point.flags,
-            )
-
-        if (
-            debug_frames_dir is not None
-            and debug_sink
-            and (idx % debug_frame_interval == 0)
-            and (debug_max_frames is None or debug_frames_written < debug_max_frames)
-        ):
-            debug_img = render_debug_frame(frame, mask, debug_sink[-1])
-            out_path = debug_frames_dir / f"frame_{idx:06d}.png"
-            if cv2.imwrite(str(out_path), debug_img):
-                debug_frames_written += 1
-
-        # --- Adjust confidence based on detector state ---
-        if detector_state is not None and point.x is not None:
-            extra_flags = list(point.flags)
-            conf = point.confidence
-            if det_info is not None and det_info.detector_used:
-                if det_info.detector_score is not None and det_info.detector_score >= config.detector.min_score:
-                    pass  # fresh, good detection: keep full confidence
-                elif det_info.detector_score is not None and det_info.detector_score < config.detector.min_score:
-                    conf *= 0.85
-                    if "DETECTOR_LOW_SCORE" not in extra_flags:
-                        extra_flags.append("DETECTOR_LOW_SCORE")
-            elif detector_state.frames_since_detect > config.detector.every_n_frames * 2:
-                conf *= 0.85
-                if "DETECTOR_STALE_ROI" not in extra_flags:
-                    extra_flags.append("DETECTOR_STALE_ROI")
-
-            if extra_flags != point.flags or conf != point.confidence:
+        # --- Detector-first early exit (when detector enabled) ---
+        # 1. Detector ran and found mouse with confidence -> use bbox center, skip pipeline
+        # 2. Detector ran and found nothing, waiting for first detection -> emit null, skip pipeline
+        point: TrackPoint | None = None
+        if detector_state is not None and det_info is not None and det_info.detector_used:
+            if (
+                det_info.detector_score is not None
+                and det_info.detector_score >= config.detector.min_score
+                and roi_xyxy is not None
+            ):
+                # Use detector bbox center directly (original video coords)
+                cx = (roi_xyxy[0] + roi_xyxy[2]) / 2.0
+                cy = (roi_xyxy[1] + roi_xyxy[3]) / 2.0
                 point = TrackPoint(
-                    frame_idx=point.frame_idx,
-                    x=point.x,
-                    y=point.y,
-                    area=point.area,
-                    confidence=conf,
-                    flags=extra_flags,
+                    frame_idx=idx,
+                    x=cx,
+                    y=cy,
+                    area=None,
+                    confidence=det_info.detector_score,
+                    flags=["DETECTOR_DIRECT"],
+                )
+                tracking_started = True
+            elif (
+                config.detector.start_tracking_after_first_detection
+                and not tracking_started
+            ):
+                # No confident detection, still waiting for first -> emit null, skip pipeline
+                point = TrackPoint(
+                    frame_idx=idx,
+                    x=None,
+                    y=None,
+                    area=None,
+                    confidence=0.0,
+                    flags=[],
                 )
 
-        # --- Update Kalman / adaptive area in processing space -----------
-        if point.x is not None and point.y is not None:
-            if kalman is not None:
-                if not kalman.initialized:
-                    kalman.initialize(point.x, point.y)
-                else:
-                    cx, cy = kalman.update(point.x, point.y)
-                    # Use Kalman-corrected position (smooths jitter)
-                    point = TrackPoint(
-                        frame_idx=point.frame_idx,
-                        x=cx,
-                        y=cy,
-                        area=point.area,
-                        confidence=point.confidence,
-                        flags=point.flags,
+        # Full pipeline only when we didn't take a detector-first shortcut
+        if point is None:
+            # Downsample frame if downsampling is enabled
+            if downsample_factor is not None:
+                frame = _downsample_frame(frame, downsample_factor)
+                # Scale ROI to downsampled space
+                if roi_xyxy is not None:
+                    roi_xyxy = (
+                        int(roi_xyxy[0] / downsample_factor),
+                        int(roi_xyxy[1] / downsample_factor),
+                        int(roi_xyxy[2] / downsample_factor),
+                        int(roi_xyxy[3] / downsample_factor),
                     )
-            if area_filter is not None and point.area is not None:
-                area_filter.update(point.area)
-        else:
-            if kalman is not None and kalman.initialized:
-                kalman.mark_no_measurement()
-                # --- Kalman coasting: emit predicted position -----------
-                if coast_limit > 0 and kalman.frames_without_measurement <= coast_limit:
+
+            # Raw grayscale (original intensity — for candidate scoring)
+            raw_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame.copy()
+
+            gray = preprocess_frame(frame, effective_config.preprocessing, background)
+            mask = segment_frame(gray, effective_config.segmentation, effective_config.morphology)
+
+            # Apply arena ROI mask — discard foreground outside the arena
+            if arena_mask is not None:
+                mask = cv2.bitwise_and(mask, arena_mask)
+
+            # Chrominance / luminance filter — suppress shadows while keeping
+            # objects that differ from the background in *either* colour or
+            # brightness.  A shadow has the same hue AND a small brightness
+            # change; a real object (the mouse) will differ in at least one.
+            if (
+                effective_config.chroma_filter.enabled
+                and background is not None
+                and background.image_bgr is not None
+                and frame.ndim == 3
+            ):
+                lab_f = cv2.cvtColor(frame, cv2.COLOR_BGR2Lab)
+                lab_bg = cv2.cvtColor(background.image_bgr, cv2.COLOR_BGR2Lab)
+                chroma_diff = cv2.max(
+                    cv2.absdiff(lab_f[:, :, 1], lab_bg[:, :, 1]),
+                    cv2.absdiff(lab_f[:, :, 2], lab_bg[:, :, 2]),
+                )
+                luma_diff = cv2.absdiff(lab_f[:, :, 0], lab_bg[:, :, 0])
+                # Keep pixel if chrominance differs OR luminance differs a lot
+                _, chroma_ok = cv2.threshold(
+                    chroma_diff,
+                    effective_config.chroma_filter.threshold,
+                    255,
+                    cv2.THRESH_BINARY,
+                )
+                _, luma_ok = cv2.threshold(
+                    luma_diff,
+                    effective_config.chroma_filter.luma_threshold,
+                    255,
+                    cv2.THRESH_BINARY,
+                )
+                chroma_mask = cv2.bitwise_or(chroma_ok, luma_ok)
+                mask = cv2.bitwise_and(mask, chroma_mask)
+
+            # Apply motion mask — discard static foreground
+            if motion is not None:
+                motion_mask = motion.update(gray)
+                # Kalman search window: allow detection near predicted position
+                # even when the mouse is stationary (motion mask would suppress it)
+                if kalman is not None and kalman.initialized:
                     pred = kalman.predicted_position
                     if pred is not None:
-                        coast_conf = max(
-                            0.30,
-                            0.85 - 0.01 * kalman.frames_without_measurement,
+                        r = int(kalman.search_radius())
+                        cv2.circle(
+                            motion_mask,
+                            (int(round(pred[0])), int(round(pred[1]))),
+                            r, 255, -1,
                         )
-                        point = TrackPoint(
-                            frame_idx=idx,
-                            x=pred[0],
-                            y=pred[1],
-                            area=previous.area if previous is not None and previous.area is not None else None,
-                            confidence=coast_conf,
-                            flags=["KALMAN_COAST"],
-                        )
-                # --------------------------------------------------------
-        # -----------------------------------------------------------------
+                mask = cv2.bitwise_and(mask, motion_mask)
 
-        # Scale coordinates back to original resolution
-        if downsample_factor is not None and point.x is not None and point.y is not None:
+            # --- Crop mask and gray to detector ROI (if available) ---
+            roi_offset_x = 0
+            roi_offset_y = 0
+            if roi_xyxy is not None:
+                rx1, ry1, rx2, ry2 = roi_xyxy
+                # Ensure valid crop region
+                if rx2 > rx1 and ry2 > ry1:
+                    mask = mask[ry1:ry2, rx1:rx2]
+                    raw_gray = raw_gray[ry1:ry2, rx1:rx2]
+                    roi_offset_x = rx1
+                    roi_offset_y = ry1
+
+            # Kalman predict (before track_frame so gating uses the prediction)
+            # Adjust Kalman prediction to ROI space if we have a detector ROI
+            if kalman is not None and kalman.initialized:
+                kalman.predict()
+
+            # When using ROI, adjust 'previous' to ROI-local coordinates for tracking
+            roi_previous = previous
+            if roi_xyxy is not None and previous is not None and previous.x is not None and previous.y is not None:
+                roi_previous = TrackPoint(
+                    frame_idx=previous.frame_idx,
+                    x=previous.x - roi_offset_x,
+                    y=previous.y - roi_offset_y,
+                    area=previous.area,
+                    confidence=previous.confidence,
+                    flags=previous.flags,
+                )
+
+            if debug_frames_dir is not None:
+                debug_sink.clear()
+            point = track_frame(
+                mask,
+                frame_idx=idx,
+                tracking=effective_config.tracking,
+                previous=roi_previous,
+                ambiguity_confidence=effective_config.ambiguity_confidence,
+                shadow_confidence=effective_config.shadow_confidence,
+                gray_frame=raw_gray,
+                kalman=kalman if roi_xyxy is None else None,  # skip Kalman gating inside ROI
+                adaptive_area=area_filter,
+                debug_sink=debug_sink if debug_frames_dir is not None else None,
+            )
+
+            # Convert ROI-local coords back to global (processing-resolution)
+            if roi_xyxy is not None and point.x is not None and point.y is not None:
+                point = TrackPoint(
+                    frame_idx=point.frame_idx,
+                    x=point.x + roi_offset_x,
+                    y=point.y + roi_offset_y,
+                    area=point.area,
+                    confidence=point.confidence,
+                    flags=point.flags,
+                )
+
+            if (
+                debug_frames_dir is not None
+                and debug_sink
+                and (idx % debug_frame_interval == 0)
+                and (debug_max_frames is None or debug_frames_written < debug_max_frames)
+            ):
+                # Use full frame; when mask is cropped to ROI, expand it and pass offset for blob coords
+                debug_mask = mask
+                off_x, off_y = 0, 0
+                if roi_xyxy is not None:
+                    rx1, ry1, rx2, ry2 = roi_xyxy
+                    if rx2 > rx1 and ry2 > ry1:
+                        h, w = frame.shape[:2]
+                        debug_mask = np.zeros((h, w), dtype=mask.dtype)
+                        debug_mask[ry1:ry2, rx1:rx2] = mask
+                        off_x, off_y = rx1, ry1
+                debug_img = render_debug_frame(
+                    frame, debug_mask, debug_sink[-1],
+                    roi_offset_x=off_x, roi_offset_y=off_y,
+                )
+                out_path = debug_frames_dir / f"frame_{idx:06d}.png"
+                if cv2.imwrite(str(out_path), debug_img):
+                    debug_frames_written += 1
+
+            # --- Adjust confidence based on detector state ---
+            if detector_state is not None and point.x is not None:
+                extra_flags = list(point.flags)
+                conf = point.confidence
+                if det_info is not None and det_info.detector_used:
+                    if det_info.detector_score is not None and det_info.detector_score >= config.detector.min_score:
+                        pass  # fresh, good detection: keep full confidence
+                    elif det_info.detector_score is not None and det_info.detector_score < config.detector.min_score:
+                        conf *= 0.85
+                        if "DETECTOR_LOW_SCORE" not in extra_flags:
+                            extra_flags.append("DETECTOR_LOW_SCORE")
+                elif detector_state.frames_since_detect > config.detector.every_n_frames * 2:
+                    conf *= 0.85
+                    if "DETECTOR_STALE_ROI" not in extra_flags:
+                        extra_flags.append("DETECTOR_STALE_ROI")
+
+                if extra_flags != point.flags or conf != point.confidence:
+                    point = TrackPoint(
+                        frame_idx=point.frame_idx,
+                        x=point.x,
+                        y=point.y,
+                        area=point.area,
+                        confidence=conf,
+                        flags=extra_flags,
+                    )
+
+            # --- Start-after-first-detection: null out points until detector finds mouse ---
+            if not tracking_started:
+                if (
+                    det_info is not None
+                    and det_info.detector_used
+                    and det_info.detector_score is not None
+                    and det_info.detector_score >= config.detector.min_score
+                ):
+                    tracking_started = True
+                else:
+                    point = TrackPoint(
+                        frame_idx=idx,
+                        x=None,
+                        y=None,
+                        area=None,
+                        confidence=0.0,
+                        flags=[],
+                    )
+
+            # --- Update Kalman / adaptive area in processing space -----------
+            if point.x is not None and point.y is not None:
+                if kalman is not None:
+                    if not kalman.initialized:
+                        kalman.initialize(point.x, point.y)
+                    else:
+                        cx, cy = kalman.update(point.x, point.y)
+                        # Use Kalman-corrected position (smooths jitter)
+                        point = TrackPoint(
+                            frame_idx=point.frame_idx,
+                            x=cx,
+                            y=cy,
+                            area=point.area,
+                            confidence=point.confidence,
+                            flags=point.flags,
+                        )
+                if area_filter is not None and point.area is not None:
+                    area_filter.update(point.area)
+            else:
+                if kalman is not None and kalman.initialized:
+                    kalman.mark_no_measurement()
+                    # --- Kalman coasting: emit predicted position -----------
+                    # Do NOT coast on black/empty frames: no foreground = no valid info
+                    mask_foreground_px = cv2.countNonZero(mask)
+                    min_foreground_for_coast = effective_config.tracking.min_area_px
+                    if (
+                        coast_limit > 0
+                        and kalman.frames_without_measurement <= coast_limit
+                        and mask_foreground_px >= min_foreground_for_coast
+                    ):
+                        pred = kalman.predicted_position
+                        if pred is not None:
+                            coast_conf = max(
+                                0.30,
+                                0.85 - 0.01 * kalman.frames_without_measurement,
+                            )
+                            point = TrackPoint(
+                                frame_idx=idx,
+                                x=pred[0],
+                                y=pred[1],
+                                area=previous.area if previous is not None and previous.area is not None else None,
+                                confidence=coast_conf,
+                                flags=["KALMAN_COAST"],
+                            )
+                    # --------------------------------------------------------
+            # -----------------------------------------------------------------
+
+        # Scale coordinates back to original resolution (skip for DETECTOR_DIRECT - already original)
+        if (
+            downsample_factor is not None
+            and point.x is not None
+            and point.y is not None
+            and "DETECTOR_DIRECT" not in point.flags
+        ):
             scaled_x = point.x * downsample_factor
             scaled_y = point.y * downsample_factor
             scaled_area = point.area * (downsample_factor * downsample_factor) if point.area is not None else None
@@ -1002,9 +1093,19 @@ def _track_video(
                     confidence=point.confidence,
                     flags=point.flags,
                 )
-        else:
-            # No downsampling, use point directly for previous
-            if point.x is not None and point.y is not None:
+        elif point.x is not None and point.y is not None:
+            # No downsampling, or DETECTOR_DIRECT (already in original coords)
+            if downsample_factor is not None and "DETECTOR_DIRECT" in point.flags:
+                # Keep previous in processing (downsampled) space for next frame
+                previous = TrackPoint(
+                    frame_idx=point.frame_idx,
+                    x=point.x / downsample_factor,
+                    y=point.y / downsample_factor,
+                    area=point.area,
+                    confidence=point.confidence,
+                    flags=point.flags,
+                )
+            else:
                 previous = point
 
         if point.x is not None and point.y is not None:
@@ -1050,6 +1151,21 @@ def _update_ema(
     )
 
 
+def _compute_first_detection_frame(
+    det_infos: list[FrameDetectorInfo],
+    min_score: float,
+) -> int | None:
+    """Return the first frame index with a valid detector detection, or None if never."""
+    for i, di in enumerate(det_infos):
+        if (
+            di.detector_used
+            and di.detector_score is not None
+            and di.detector_score >= min_score
+        ):
+            return i
+    return None
+
+
 def _process_chunk(
     video_path: Path,
     chunk_start: int,
@@ -1063,6 +1179,7 @@ def _process_chunk(
     progress_interval: int = 10,
     arena_mask: np.ndarray | None = None,
     det_infos: list[FrameDetectorInfo] | None = None,
+    first_detection_frame: int | None = None,
 ) -> list[TrackPoint]:
     """Process a chunk of frames from a video.
 
@@ -1077,6 +1194,7 @@ def _process_chunk(
         progress_tracker: Optional thread-safe progress tracker for real-time updates.
         progress_interval: Report progress every N frames within the chunk.
         arena_mask: Optional arena ROI mask at processing resolution (255 = inside).
+        first_detection_frame: If set, frames with idx < this are emitted as null (start-after-first-detection).
 
     Returns:
         List of TrackPoints for frames in [chunk_start, chunk_end).
@@ -1138,169 +1256,226 @@ def _process_chunk(
         for idx, frame in reader.iter_frames(start_frame=chunk_start, end_frame=chunk_end):
             # Optional detector ROI (full-resolution coords from pre-pass)
             roi_xyxy: tuple[int, int, int, int] | None = None
+            di: FrameDetectorInfo | None = None
             if det_infos is not None and idx < len(det_infos):
-                roi_xyxy = det_infos[idx].roi_xyxy
+                di = det_infos[idx]
+                roi_xyxy = di.roi_xyxy
 
-            # Downsample frame if downsampling is enabled
-            if downsample_factor is not None:
-                frame = _downsample_frame(frame, downsample_factor)
-                # Scale ROI to downsampled space
-                if roi_xyxy is not None:
-                    roi_xyxy = (
-                        int(roi_xyxy[0] / downsample_factor),
-                        int(roi_xyxy[1] / downsample_factor),
-                        int(roi_xyxy[2] / downsample_factor),
-                        int(roi_xyxy[3] / downsample_factor),
-                    )
-
-            # Raw grayscale (original intensity — for candidate scoring)
-            raw_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame.copy()
-
-            gray = preprocess_frame(frame, effective_config.preprocessing, background)
-            mask = segment_frame(gray, effective_config.segmentation, effective_config.morphology)
-
-            # Apply arena ROI mask — discard foreground outside the arena
-            if arena_mask is not None:
-                mask = cv2.bitwise_and(mask, arena_mask)
-
-            # Chrominance / luminance filter — suppress shadows while keeping
-            # objects that differ from the background in colour or brightness.
+            # --- Detector-first early exit (when detector enabled) ---
+            point: TrackPoint | None = None
             if (
-                effective_config.chroma_filter.enabled
-                and background is not None
-                and background.image_bgr is not None
-                and frame.ndim == 3
+                det_infos is not None
+                and di is not None
+                and di.detector_used
+                and config.detector.enabled
             ):
-                lab_f = cv2.cvtColor(frame, cv2.COLOR_BGR2Lab)
-                lab_bg = cv2.cvtColor(background.image_bgr, cv2.COLOR_BGR2Lab)
-                chroma_diff = cv2.max(
-                    cv2.absdiff(lab_f[:, :, 1], lab_bg[:, :, 1]),
-                    cv2.absdiff(lab_f[:, :, 2], lab_bg[:, :, 2]),
-                )
-                luma_diff = cv2.absdiff(lab_f[:, :, 0], lab_bg[:, :, 0])
-                # Keep pixel if chrominance differs OR luminance differs a lot
-                _, chroma_ok = cv2.threshold(
-                    chroma_diff,
-                    effective_config.chroma_filter.threshold,
-                    255,
-                    cv2.THRESH_BINARY,
-                )
-                _, luma_ok = cv2.threshold(
-                    luma_diff,
-                    effective_config.chroma_filter.luma_threshold,
-                    255,
-                    cv2.THRESH_BINARY,
-                )
-                chroma_mask = cv2.bitwise_or(chroma_ok, luma_ok)
-                mask = cv2.bitwise_and(mask, chroma_mask)
-
-            # --- Crop mask and gray to detector ROI (if available) ---
-            roi_offset_x = 0
-            roi_offset_y = 0
-            if roi_xyxy is not None:
-                rx1, ry1, rx2, ry2 = roi_xyxy
-                # Ensure valid crop region
-                if rx2 > rx1 and ry2 > ry1:
-                    mask = mask[ry1:ry2, rx1:rx2]
-                    raw_gray = raw_gray[ry1:ry2, rx1:rx2]
-                    roi_offset_x = rx1
-                    roi_offset_y = ry1
-
-            # Apply motion mask — discard static foreground
-            if motion is not None:
-                motion_mask = motion.update(gray)
-                # Kalman search window: keep detection near predicted pos
-                if kalman is not None and kalman.initialized:
-                    pred = kalman.predicted_position
-                    if pred is not None:
-                        r = int(kalman.search_radius())
-                        cv2.circle(
-                            motion_mask,
-                            (int(round(pred[0])), int(round(pred[1]))),
-                            r, 255, -1,
-                        )
-                mask = cv2.bitwise_and(mask, motion_mask)
-
-            # Kalman predict (before track_frame)
-            if kalman is not None and kalman.initialized:
-                kalman.predict()
-
-            # When using ROI, adjust 'previous' to ROI-local coordinates for tracking
-            roi_previous = previous
-            if roi_xyxy is not None and previous is not None and previous.x is not None and previous.y is not None:
-                roi_previous = TrackPoint(
-                    frame_idx=previous.frame_idx,
-                    x=previous.x - roi_offset_x,
-                    y=previous.y - roi_offset_y,
-                    area=previous.area,
-                    confidence=previous.confidence,
-                    flags=previous.flags,
-                )
-
-            point = track_frame(
-                mask,
-                frame_idx=idx,
-                tracking=effective_config.tracking,
-                previous=roi_previous,
-                ambiguity_confidence=effective_config.ambiguity_confidence,
-                shadow_confidence=effective_config.shadow_confidence,
-                gray_frame=raw_gray,
-                kalman=kalman if roi_xyxy is None else None,
-                adaptive_area=area_filter,
-            )
-
-            # Convert ROI-local coords back to global (processing-resolution)
-            if roi_xyxy is not None and point.x is not None and point.y is not None:
-                point = TrackPoint(
-                    frame_idx=point.frame_idx,
-                    x=point.x + roi_offset_x,
-                    y=point.y + roi_offset_y,
-                    area=point.area,
-                    confidence=point.confidence,
-                    flags=point.flags,
-                )
-
-            # --- Update Kalman / adaptive area in processing space -------
-            if point.x is not None and point.y is not None:
-                if kalman is not None:
-                    if not kalman.initialized:
-                        kalman.initialize(point.x, point.y)
-                    else:
-                        cx, cy = kalman.update(point.x, point.y)
+                if (
+                    di.detector_score is not None
+                    and di.detector_score >= config.detector.min_score
+                    and roi_xyxy is not None
+                ):
+                    # Use detector bbox center directly (original video coords)
+                    roi_full = det_infos[idx].roi_xyxy  # full-res before we scale
+                    if roi_full is not None:
+                        cx = (roi_full[0] + roi_full[2]) / 2.0
+                        cy = (roi_full[1] + roi_full[3]) / 2.0
                         point = TrackPoint(
-                            frame_idx=point.frame_idx,
+                            frame_idx=idx,
                             x=cx,
                             y=cy,
-                            area=point.area,
-                            confidence=point.confidence,
-                            flags=point.flags,
+                            area=None,
+                            confidence=di.detector_score,
+                            flags=["DETECTOR_DIRECT"],
                         )
-                if area_filter is not None and point.area is not None:
-                    area_filter.update(point.area)
-            else:
-                if kalman is not None and kalman.initialized:
-                    kalman.mark_no_measurement()
-                    # --- Kalman coasting ---
-                    if coast_limit > 0 and kalman.frames_without_measurement <= coast_limit:
+                elif (
+                    config.detector.start_tracking_after_first_detection
+                    and first_detection_frame is not None
+                    and idx < first_detection_frame
+                ):
+                    # No confident detection, still waiting for first -> emit null, skip pipeline
+                    point = TrackPoint(
+                        frame_idx=idx,
+                        x=None,
+                        y=None,
+                        area=None,
+                        confidence=0.0,
+                        flags=[],
+                    )
+
+            # Full pipeline only when we didn't take a detector-first shortcut
+            if point is None:
+                # Downsample frame if downsampling is enabled
+                if downsample_factor is not None:
+                    frame = _downsample_frame(frame, downsample_factor)
+                    # Scale ROI to downsampled space
+                    if roi_xyxy is not None:
+                        roi_xyxy = (
+                            int(roi_xyxy[0] / downsample_factor),
+                            int(roi_xyxy[1] / downsample_factor),
+                            int(roi_xyxy[2] / downsample_factor),
+                            int(roi_xyxy[3] / downsample_factor),
+                        )
+
+                # Raw grayscale (original intensity — for candidate scoring)
+                raw_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame.copy()
+
+                gray = preprocess_frame(frame, effective_config.preprocessing, background)
+                mask = segment_frame(gray, effective_config.segmentation, effective_config.morphology)
+
+                # Apply arena ROI mask — discard foreground outside the arena
+                if arena_mask is not None:
+                    mask = cv2.bitwise_and(mask, arena_mask)
+
+                # Chrominance / luminance filter — suppress shadows while keeping
+                # objects that differ from the background in colour or brightness.
+                if (
+                    effective_config.chroma_filter.enabled
+                    and background is not None
+                    and background.image_bgr is not None
+                    and frame.ndim == 3
+                ):
+                    lab_f = cv2.cvtColor(frame, cv2.COLOR_BGR2Lab)
+                    lab_bg = cv2.cvtColor(background.image_bgr, cv2.COLOR_BGR2Lab)
+                    chroma_diff = cv2.max(
+                        cv2.absdiff(lab_f[:, :, 1], lab_bg[:, :, 1]),
+                        cv2.absdiff(lab_f[:, :, 2], lab_bg[:, :, 2]),
+                    )
+                    luma_diff = cv2.absdiff(lab_f[:, :, 0], lab_bg[:, :, 0])
+                    # Keep pixel if chrominance differs OR luminance differs a lot
+                    _, chroma_ok = cv2.threshold(
+                        chroma_diff,
+                        effective_config.chroma_filter.threshold,
+                        255,
+                        cv2.THRESH_BINARY,
+                    )
+                    _, luma_ok = cv2.threshold(
+                        luma_diff,
+                        effective_config.chroma_filter.luma_threshold,
+                        255,
+                        cv2.THRESH_BINARY,
+                    )
+                    chroma_mask = cv2.bitwise_or(chroma_ok, luma_ok)
+                    mask = cv2.bitwise_and(mask, chroma_mask)
+
+                # --- Crop mask and gray to detector ROI (if available) ---
+                roi_offset_x = 0
+                roi_offset_y = 0
+                if roi_xyxy is not None:
+                    rx1, ry1, rx2, ry2 = roi_xyxy
+                    # Ensure valid crop region
+                    if rx2 > rx1 and ry2 > ry1:
+                        mask = mask[ry1:ry2, rx1:rx2]
+                        raw_gray = raw_gray[ry1:ry2, rx1:rx2]
+                        roi_offset_x = rx1
+                        roi_offset_y = ry1
+
+                # Apply motion mask — discard static foreground
+                if motion is not None:
+                    motion_mask = motion.update(gray)
+                    # Kalman search window: keep detection near predicted pos
+                    if kalman is not None and kalman.initialized:
                         pred = kalman.predicted_position
                         if pred is not None:
-                            coast_conf = max(
-                                0.30,
-                                0.85 - 0.01 * kalman.frames_without_measurement,
+                            r = int(kalman.search_radius())
+                            cv2.circle(
+                                motion_mask,
+                                (int(round(pred[0])), int(round(pred[1]))),
+                                r, 255, -1,
                             )
-                            point = TrackPoint(
-                                frame_idx=idx,
-                                x=pred[0],
-                                y=pred[1],
-                                area=previous.area if previous is not None and previous.area is not None else None,
-                                confidence=coast_conf,
-                                flags=["KALMAN_COAST"],
-                            )
-                    # -----------------------
-            # -------------------------------------------------------------
+                    mask = cv2.bitwise_and(mask, motion_mask)
 
-            # Scale coordinates back to original resolution
-            if downsample_factor is not None and point.x is not None and point.y is not None:
+                # Kalman predict (before track_frame)
+                if kalman is not None and kalman.initialized:
+                    kalman.predict()
+
+                # When using ROI, adjust 'previous' to ROI-local coordinates for tracking
+                roi_previous = previous
+                if roi_xyxy is not None and previous is not None and previous.x is not None and previous.y is not None:
+                    roi_previous = TrackPoint(
+                        frame_idx=previous.frame_idx,
+                        x=previous.x - roi_offset_x,
+                        y=previous.y - roi_offset_y,
+                        area=previous.area,
+                        confidence=previous.confidence,
+                        flags=previous.flags,
+                    )
+
+                point = track_frame(
+                    mask,
+                    frame_idx=idx,
+                    tracking=effective_config.tracking,
+                    previous=roi_previous,
+                    ambiguity_confidence=effective_config.ambiguity_confidence,
+                    shadow_confidence=effective_config.shadow_confidence,
+                    gray_frame=raw_gray,
+                    kalman=kalman if roi_xyxy is None else None,
+                    adaptive_area=area_filter,
+                )
+
+                # Convert ROI-local coords back to global (processing-resolution)
+                if roi_xyxy is not None and point.x is not None and point.y is not None:
+                    point = TrackPoint(
+                        frame_idx=point.frame_idx,
+                        x=point.x + roi_offset_x,
+                        y=point.y + roi_offset_y,
+                        area=point.area,
+                        confidence=point.confidence,
+                        flags=point.flags,
+                    )
+
+                # --- Update Kalman / adaptive area in processing space -------
+                if point.x is not None and point.y is not None:
+                    if kalman is not None:
+                        if not kalman.initialized:
+                            kalman.initialize(point.x, point.y)
+                        else:
+                            cx, cy = kalman.update(point.x, point.y)
+                            point = TrackPoint(
+                                frame_idx=point.frame_idx,
+                                x=cx,
+                                y=cy,
+                                area=point.area,
+                                confidence=point.confidence,
+                                flags=point.flags,
+                            )
+                    if area_filter is not None and point.area is not None:
+                        area_filter.update(point.area)
+                else:
+                    if kalman is not None and kalman.initialized:
+                        kalman.mark_no_measurement()
+                        # --- Kalman coasting ---
+                        # Do NOT coast on black/empty frames: no foreground = no valid info
+                        mask_foreground_px = cv2.countNonZero(mask)
+                        min_foreground_for_coast = effective_config.tracking.min_area_px
+                        if (
+                            coast_limit > 0
+                            and kalman.frames_without_measurement <= coast_limit
+                            and mask_foreground_px >= min_foreground_for_coast
+                        ):
+                            pred = kalman.predicted_position
+                            if pred is not None:
+                                coast_conf = max(
+                                    0.30,
+                                    0.85 - 0.01 * kalman.frames_without_measurement,
+                                )
+                                point = TrackPoint(
+                                    frame_idx=idx,
+                                    x=pred[0],
+                                    y=pred[1],
+                                    area=previous.area if previous is not None and previous.area is not None else None,
+                                    confidence=coast_conf,
+                                    flags=["KALMAN_COAST"],
+                                )
+                        # -----------------------
+                # -------------------------------------------------------------
+
+            # Scale coordinates back to original resolution (skip for DETECTOR_DIRECT - already original)
+            if (
+                downsample_factor is not None
+                and point.x is not None
+                and point.y is not None
+                and "DETECTOR_DIRECT" not in point.flags
+            ):
                 scaled_x = point.x * downsample_factor
                 scaled_y = point.y * downsample_factor
                 scaled_area = point.area * (downsample_factor * downsample_factor) if point.area is not None else None
@@ -1322,9 +1497,18 @@ def _process_chunk(
                         confidence=point.confidence,
                         flags=point.flags,
                     )
-            else:
-                # No downsampling, use point directly for previous
-                if point.x is not None and point.y is not None:
+            elif point.x is not None and point.y is not None:
+                # No downsampling, or DETECTOR_DIRECT (already in original coords)
+                if downsample_factor is not None and "DETECTOR_DIRECT" in point.flags:
+                    previous = TrackPoint(
+                        frame_idx=point.frame_idx,
+                        x=point.x / downsample_factor,
+                        y=point.y / downsample_factor,
+                        area=point.area,
+                        confidence=point.confidence,
+                        flags=point.flags,
+                    )
+                else:
                     previous = point
 
             if point.x is not None and point.y is not None:
@@ -1339,6 +1523,21 @@ def _process_chunk(
                             confidence=point.confidence,
                             flags=point.flags,
                         )
+            # Start-after-first-detection: null out points before first detector hit
+            if (
+                first_detection_frame is not None
+                and idx < first_detection_frame
+                and point.x is not None
+                and point.y is not None
+            ):
+                point = TrackPoint(
+                    frame_idx=idx,
+                    x=None,
+                    y=None,
+                    area=None,
+                    confidence=0.0,
+                    flags=[],
+                )
             points.append(point)
 
             frame_count += 1
@@ -1576,6 +1775,17 @@ def _track_video_parallel(
         end = min(start + chunk_size, total_frames)
         chunks.append((start, end))
 
+    # Compute first detection frame for start-after-first-detection (parallel path)
+    first_detection_frame: int | None = None
+    if (
+        det_infos is not None
+        and config.detector.enabled
+        and config.detector.start_tracking_after_first_detection
+    ):
+        first_detection_frame = _compute_first_detection_frame(
+            det_infos, config.detector.min_score
+        )
+
     # Process chunks in parallel
     # Note: Chunks after the first won't have the correct previous_point,
     # but this is acceptable because:
@@ -1630,6 +1840,7 @@ def _track_video_parallel(
                     progress_interval=progress_interval,
                     arena_mask=arena_mask,
                     det_infos=det_infos,
+                    first_detection_frame=first_detection_frame,
                 )
                 future_to_chunk[future] = chunk_idx
 
@@ -1757,15 +1968,47 @@ def _jump_rate(
     return (jumps / total) if total > 0 else 0.0
 
 
+def _resize_frame_to_display_aspect(
+    frame: np.ndarray,
+    dar: str,
+) -> np.ndarray:
+    """Resize frame so that width/height matches display aspect ratio (e.g. '16:9')."""
+    try:
+        parts = dar.strip().split(":")
+        if len(parts) != 2:
+            return frame
+        w_ratio = float(parts[0])
+        h_ratio = float(parts[1])
+    except (ValueError, AttributeError):
+        return frame
+    if w_ratio <= 0 or h_ratio <= 0:
+        return frame
+    target_ratio = w_ratio / h_ratio
+    h, w = frame.shape[:2]
+    current_ratio = w / h
+    if abs(current_ratio - target_ratio) < 0.01:
+        return frame
+    if current_ratio > target_ratio:
+        new_w = int(round(h * target_ratio))
+        new_size = (new_w, h)
+    else:
+        new_h = int(round(w / target_ratio))
+        new_size = (w, new_h)
+    return cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
+
+
 def _write_detector_debug_frames(
     video_path: Path,
     det_infos: list[FrameDetectorInfo],
     points: list[TrackPoint],
     out_dir: Path,
     max_frames: int = 10,
+    min_score: float = 0.35,
 ) -> None:
-    """Write sampled frames with detector bbox overlay to *out_dir*."""
+    """Write sampled frames with detector bbox overlay and score to *out_dir*."""
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    dar = get_video_display_aspect_ratio(video_path)
 
     # Pick evenly-spaced frames that had a detector ROI
     candidates = [
@@ -1776,6 +2019,10 @@ def _write_detector_debug_frames(
 
     step = max(1, len(candidates) // max_frames)
     selected = candidates[::step][:max_frames]
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.7
+    thickness = 2
 
     with VideoReader(video_path) as reader:
         for idx, frame in reader.iter_frames():
@@ -1788,6 +2035,29 @@ def _write_detector_debug_frames(
             pt = points[idx] if idx < len(points) else None
             if pt is not None and pt.x is not None and pt.y is not None:
                 cv2.circle(frame, (int(pt.x), int(pt.y)), 5, (0, 0, 255), -1)
+
+            # Score and threshold overlay (always show something)
+            y_text = 36
+            if di.detector_score is not None:
+                score_str = f"score: {di.detector_score:.3f}"
+                meets = di.detector_score >= min_score
+                color = (0, 255, 0) if meets else (0, 0, 255)  # BGR green / red
+                cv2.putText(frame, score_str, (10, y_text), font, font_scale, color, thickness, cv2.LINE_AA)
+                y_text += 28
+                thresh_str = f"min: {min_score:.2f}  " + ("OK" if meets else "below")
+                cv2.putText(frame, thresh_str, (10, y_text), font, font_scale * 0.9, color, thickness, cv2.LINE_AA)
+            else:
+                cv2.putText(frame, "score: --", (10, y_text), font, font_scale, (128, 128, 128), thickness, cv2.LINE_AA)
+                y_text += 28
+                cv2.putText(
+                    frame,
+                    "ROI interpolated (detector not run this frame)" if not di.detector_used else "no detection",
+                    (10, y_text), font, font_scale * 0.8, (128, 128, 128), thickness, cv2.LINE_AA,
+                )
+
+            # Resize to display aspect ratio so PNG doesn't look squashed
+            if dar:
+                frame = _resize_frame_to_display_aspect(frame, dar)
             cv2.imwrite(str(out_dir / f"det_frame_{idx:06d}.png"), frame)
 
 

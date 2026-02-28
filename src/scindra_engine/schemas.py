@@ -396,6 +396,14 @@ class DetectorConfig(BaseModel):
         default=1, ge=1,
         description="Run detector only every N frames in pre-pass (1 = every scheduled frame); ROIs for in-between frames are interpolated.",
     )
+    start_tracking_after_first_detection: bool = Field(
+        default=True,
+        description="When True, only emit non-null tracking points after the first frame with a valid detector detection (score >= min_score). Prevents latching onto high-contrast objects (e.g. cabinet handles) before the mouse is detected.",
+    )
+    max_detector_bbox_area_px: int | None = Field(
+        default=None,
+        description="When set, reject detector bboxes whose area (w*h) exceeds this. Filters out spurious large detections (e.g. on black frames). In original video resolution.",
+    )
 
 
 class QCConfig(BaseModel):
