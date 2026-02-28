@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,6 +75,21 @@ class VideoReader:
         """Frame height in pixels."""
 
         return self._metadata.height
+
+    def get_actual_dimensions(self) -> tuple[int, int]:
+        """Return (width, height) from the first decoded frame.
+
+        Use this instead of .width/.height when the file may have rotation or
+        display metadata that changes decoded dimensions (e.g. CAP_PROP reports
+        1920x1080 but decoded frames are 1080x1920). Restores read position to 0.
+        """
+        self._cap.set(self._FRAME_POS_PROP, 0.0)
+        success, frame = self._cap.read()
+        self._cap.set(self._FRAME_POS_PROP, 0.0)
+        if not success or frame is None:
+            return (self._metadata.width, self._metadata.height)
+        height, width = frame.shape[:2]
+        return (int(width), int(height))
 
     def close(self) -> None:
         """Release the underlying VideoCapture."""
@@ -193,4 +209,108 @@ class FrameSampler:
         return [
             round(i * (total - 1) / (num_frames - 1)) for i in range(num_frames)
         ]
+
+
+def require_ffmpeg_available() -> None:
+    """Ensure ffmpeg and ffprobe are on PATH. Raise VideoIOError if either is missing.
+
+    The engine requires these for overlay output (setting display aspect ratio so
+    the overlay matches the input video). Install ffmpeg and ensure it is on PATH:
+    - https://ffmpeg.org/download.html
+    - Windows: choco install ffmpeg; or add ffmpeg bin to PATH
+    """
+    missing: list[str] = []
+    for cmd in ("ffmpeg", "ffprobe"):
+        try:
+            subprocess.run(
+                [cmd, "-version"],
+                capture_output=True,
+                timeout=5,
+            )
+        except FileNotFoundError:
+            missing.append(cmd)
+        except subprocess.TimeoutExpired:
+            pass  # found but slow; treat as available
+    if missing:
+        raise VideoIOError(
+            "Overlay output requires ffmpeg and ffprobe on PATH. "
+            "Missing: {}. Install ffmpeg from https://ffmpeg.org/download.html".format(
+                ", ".join(missing)
+            )
+        )
+
+
+def get_video_display_aspect_ratio(video_path: str | Path) -> str | None:
+    """Return the display aspect ratio (e.g. '9:16') from the first video stream via ffprobe.
+
+    Returns None if ffprobe is unavailable, the stream has no DAR, or on error.
+    """
+    path = Path(video_path)
+    if not path.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=display_aspect_ratio",
+                "-of",
+                "csv=p=0",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0 or not result.stdout:
+            return None
+        dar = result.stdout.strip().strip('"')
+        return dar if dar and ":" in dar else None
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+
+
+def fix_video_display_aspect_ratio(
+    video_path: Path,
+    reference_path: Path,
+) -> bool:
+    """Set the display aspect ratio of *video_path* to match *reference_path* using ffmpeg.
+
+    Uses stream copy (no re-encode). Returns True if the fix was applied, False if
+    skipped (ffmpeg unavailable, no DAR from reference, or already matching).
+    """
+    dar = get_video_display_aspect_ratio(reference_path)
+    if not dar:
+        return False
+    try:
+        # ffmpeg cannot overwrite in place; write to temp then replace
+        temp_path = video_path.with_suffix(".tmp" + video_path.suffix)
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(video_path),
+                "-c",
+                "copy",
+                "-aspect",
+                dar,
+                str(temp_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            if temp_path.exists():
+                temp_path.unlink()
+            return False
+        temp_path.replace(video_path)
+        return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
 

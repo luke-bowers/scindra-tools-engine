@@ -23,7 +23,12 @@ from scindra_engine.preprocess import BackgroundModel, build_background, preproc
 from scindra_engine.schemas import KeyFrameInterpolationConfig, TrackCentroidConfig
 from scindra_engine.segmentation import segment_frame
 from scindra_engine.tracking import AdaptiveAreaFilter, TrackFrameDebug, TrackPoint, track_frame
-from scindra_engine.video_io import FrameSampler, VideoReader
+from scindra_engine.video_io import (
+    FrameSampler,
+    VideoReader,
+    fix_video_display_aspect_ratio,
+    require_ffmpeg_available,
+)
 from scindra_engine.visualize import write_heatmap_png, write_overlay_video as _write_overlay_video
 from scindra_engine.visualize.debug_blobs import render_debug_frame
 
@@ -80,8 +85,8 @@ def run_track_centroid(
 
     with VideoReader(video_path) as reader:
         background = _build_background(reader, config)
-        width = reader.width
-        height = reader.height
+        # Use actual decoded frame dimensions (handles rotation metadata mismatch)
+        width, height = reader.get_actual_dimensions()
 
     # Build arena ROI mask once (at processing resolution)
     arena_mask = _load_or_build_arena_mask(config, height, width)
@@ -160,8 +165,10 @@ def run_track_centroid(
     _write_per_frame(per_frame_path, points, det_infos=det_infos)
 
     summary = _summarize(points, config, det_infos=det_infos)
+    # Add run context for debugging (which input video this run used)
+    run_meta = {"input_video": os.path.abspath(video_path), **summary}
     summary_path = run_dir / "tracking_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    summary_path.write_text(json.dumps(run_meta, indent=2), encoding="utf-8")
 
     overlay_enabled, heatmap_enabled, effective_trail_length = (
         _resolve_visualization_options(
@@ -173,6 +180,7 @@ def run_track_centroid(
     )
 
     if overlay_enabled:
+        require_ffmpeg_available()
         overlay_path = run_dir / "overlay.mp4"
         _write_overlay_video(
             str(video_path),
@@ -180,6 +188,8 @@ def run_track_centroid(
             str(overlay_path),
             trail_length=effective_trail_length,
         )
+        # Match input display aspect ratio so the overlay doesn't look stretched/squashed
+        fix_video_display_aspect_ratio(overlay_path, video_path)
 
     if heatmap_enabled:
         if width <= 0 or height <= 0:
@@ -206,7 +216,7 @@ def run_track_centroid(
             max_frames=config.detector.detector_debug_frame_count,
         )
 
-    return TrackCentroidResult(run_dir=run_dir, points=points, summary=summary)
+    return TrackCentroidResult(run_dir=run_dir, points=points, summary=run_meta)
 
 
 def _make_run_id() -> str:

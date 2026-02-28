@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "scindra-engine"
 version = "0.1.0"
-description = "Scindra tools engine"
+description = "Scindra tools engine. Requires ffmpeg (and ffprobe) on PATH for overlay output."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"

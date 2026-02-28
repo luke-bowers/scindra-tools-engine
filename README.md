@@ -5,6 +5,7 @@ Scindra tools engine.
 ## Requirements
 
 - Python 3.11+
+- **ffmpeg** (including **ffprobe**) on your PATH — required for overlay output so the overlay video’s display aspect ratio matches the input. [Download ffmpeg](https://ffmpeg.org/download.html) (e.g. Windows: `choco install ffmpeg`).
 
 ## Installation
 

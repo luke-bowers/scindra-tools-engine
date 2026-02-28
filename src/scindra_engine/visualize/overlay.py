@@ -47,9 +47,9 @@ def write_overlay_video(
 
     with VideoReader(src_path) as reader:
         fps = reader.fps
-        width = reader.width
-        height = reader.height
         total_frames = reader.frame_count
+        # Use actual decoded frame dimensions (handles rotation metadata mismatch)
+        width, height = reader.get_actual_dimensions()
 
         fourcc = int(getattr(cv2, "VideoWriter_fourcc")(*"mp4v"))
         writer = cv2.VideoWriter(str(dst_path), fourcc, fps, (width, height))
