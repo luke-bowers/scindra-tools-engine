@@ -158,6 +158,7 @@ def run_track_centroid(
     parallel_workers: int | None = None,
     chunk_size: int | None = None,
     detector: Detector | None = None,
+    command: str | None = None,
 ) -> TrackCentroidResult:
     run_id = _make_run_id()
     run_dir = out_dir / f"run_{run_id}"
@@ -316,8 +317,14 @@ def run_track_centroid(
     _write_per_frame(per_frame_path, points, det_infos=det_infos)
 
     summary = _summarize(points, config, det_infos=det_infos)
-    # Add run context for debugging (which input video this run used)
-    run_meta = {"input_video": os.path.abspath(video_path), **summary}
+    # Add run context for replication: command, config, and input video
+    run_meta: dict[str, object] = {
+        "input_video": os.path.abspath(video_path),
+        **summary,
+    }
+    if command is not None:
+        run_meta["command"] = command
+    run_meta["config"] = config.model_dump(mode="json")
     summary_path = run_dir / "tracking_summary.json"
     summary_path.write_text(json.dumps(run_meta, indent=2), encoding="utf-8")
 

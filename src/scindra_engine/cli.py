@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import platform
+import shlex
+import sys
 import time
 from pathlib import Path
 
@@ -441,6 +443,7 @@ def track_centroid(
             else:
                 typer.echo(msg)
 
+        command = shlex.join(sys.argv)
         run_track_centroid(
             video_path=video,
             out_dir=out_dir,
@@ -452,6 +455,7 @@ def track_centroid(
             parallel_workers=workers,
             chunk_size=chunk_size,
             detector=det_instance,
+            command=command,
         )
     except (FileNotFoundError, VideoIOError, OSError) as e:
         typer.echo(f"Error: could not open video '{video}': {e}", err=True)
