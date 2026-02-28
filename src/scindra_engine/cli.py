@@ -324,6 +324,19 @@ def track_centroid(
         min=0.0,
         help="Max ROI center jump as fraction of bbox size. Overrides max_roi_jump_px when set.",
     ),
+    overlay_scale: float = typer.Option(
+        0.25,
+        "--overlay-scale",
+        min=0.05,
+        max=1.0,
+        help="Scale factor for overlay video resolution (1.0 = full-res, 0.25 = quarter-res).",
+    ),
+    heatmap_blur_ksize: int | None = typer.Option(
+        None,
+        "--heatmap-blur-ksize",
+        min=1,
+        help="Gaussian blur kernel size for heatmap (must be odd). When omitted, use config default.",
+    ),
 ) -> None:
     """Track a centroid using the classical backend."""
     try:
@@ -342,6 +355,10 @@ def track_centroid(
             overrides["debug_frame_interval"] = debug_interval
         if debug_max_frames is not None:
             overrides["debug_max_frames"] = debug_max_frames
+        if overlay_scale is not None:
+            overrides["overlay_scale"] = overlay_scale
+        if heatmap_blur_ksize is not None:
+            overrides["heatmap_blur_ksize"] = heatmap_blur_ksize
         if overrides:
             config = config.model_copy(update=overrides)
 
@@ -371,48 +388,58 @@ def track_centroid(
 
         # Track start time for progress reporting
         start_time = time.time()
+        last_line_length = 0
 
         def progress_callback(done: int, total: int) -> None:
-            if total > 0:
-                current_time = time.time()
-                elapsed = current_time - start_time
-                
-                # Calculate percentage
-                percentage = (done / total) * 100
-                
-                # Calculate rate (frames per second)
-                if done > 0 and elapsed > 0:
-                    rate = done / elapsed
-                else:
-                    rate = 0.0
-                
-                # Estimate time remaining
-                if done > 0 and done < total:
-                    remaining_frames = total - done
-                    if rate > 0:
-                        eta_seconds = remaining_frames / rate
-                        eta_str = _format_duration(eta_seconds)
-                    else:
-                        eta_str = "?"
-                elif done >= total:
-                    eta_str = "0s"
-                else:
-                    eta_str = "?"
-                
-                elapsed_str = _format_duration(elapsed)
-                
-                # Format rate
-                if rate > 0:
-                    rate_str = f"{rate:.1f} fps"
-                else:
-                    rate_str = "0.0 fps"
-                
-                typer.echo(
-                    f"PROGRESS {done}/{total} ({percentage:.1f}%) | "
-                    f"Elapsed: {elapsed_str} | "
-                    f"Rate: {rate_str} | "
-                    f"ETA: {eta_str}"
-                )
+            nonlocal last_line_length
+
+            if total <= 0:
+                return
+
+            current_time = time.time()
+            elapsed = current_time - start_time
+
+            # Calculate percentage
+            percentage = (done / total) * 100
+
+            # Calculate rate (frames per second)
+            if done > 0 and elapsed > 0:
+                rate = done / elapsed
+            else:
+                rate = 0.0
+
+            # Estimate time remaining
+            if done > 0 and done < total and rate > 0:
+                remaining_frames = total - done
+                eta_seconds = remaining_frames / rate
+                eta_str = _format_duration(eta_seconds)
+            elif done >= total:
+                eta_str = "0s"
+            else:
+                eta_str = "?"
+
+            elapsed_str = _format_duration(elapsed)
+
+            # Format rate
+            rate_str = f"{rate:.1f} fps" if rate > 0 else "0.0 fps"
+
+            base_msg = (
+                f"PROGRESS {done}/{total} ({percentage:.1f}%) | "
+                f"Elapsed: {elapsed_str} | "
+                f"Rate: {rate_str} | "
+                f"ETA: {eta_str}"
+            )
+
+            # Pad with spaces to fully overwrite previous content
+            pad = max(0, last_line_length - len(base_msg))
+            msg = "\r" + base_msg + (" " * pad)
+            last_line_length = len(base_msg)
+
+            # For intermediate updates, stay on the same line; on completion, end the line
+            if done < total:
+                typer.echo(msg, nl=False)
+            else:
+                typer.echo(msg)
 
         run_track_centroid(
             video_path=video,

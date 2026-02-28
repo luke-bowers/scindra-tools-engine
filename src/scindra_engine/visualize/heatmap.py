@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -15,6 +16,7 @@ def write_heatmap_png(
     out_path: str,
     *,
     blur_ksize: int = 31,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> None:
     """Write a heatmap PNG showing spatial density of centroids.
 
@@ -35,6 +37,9 @@ def write_heatmap_png(
 
     accum = np.zeros((height, width), dtype=np.float32)
 
+    total_points = len(track_points)
+    processed = 0
+
     for point in track_points:
         if point.x is None or point.y is None:
             continue
@@ -45,6 +50,9 @@ def write_heatmap_png(
             cx = min(max(cx, 0), width - 1)
             cy = min(max(cy, 0), height - 1)
         accum[cy, cx] += 1.0
+        processed += 1
+        if progress_callback is not None and total_points > 0:
+            progress_callback(processed, total_points)
 
     blurred = cv2.GaussianBlur(accum, (blur_ksize, blur_ksize), 0)
 

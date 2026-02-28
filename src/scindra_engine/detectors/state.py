@@ -126,6 +126,38 @@ class DetectorState:
 
         return info
 
+    def apply_detection_result(
+        self,
+        result: DetectorResult,
+        frame_hw: tuple[int, int],
+    ) -> FrameDetectorInfo:
+        """Apply a precomputed detection result and return ROI info.
+
+        Used when inference was run in a batch; state is updated and
+        FrameDetectorInfo for this frame is returned.
+        """
+        info = FrameDetectorInfo()
+        info.detector_used = True
+        info.detector_score = result.confidence
+        self._apply_result(result, frame_hw)
+        if self.last_bbox is not None:
+            info.roi_xyxy = self._padded_roi(self.last_bbox, frame_hw)
+        return info
+
+    def info_for_frame_without_run(
+        self,
+        frame_hw: tuple[int, int],
+    ) -> FrameDetectorInfo:
+        """Return FrameDetectorInfo for a frame where the detector was not run.
+
+        ROI is taken from current last_bbox (stale); detector_used=False.
+        """
+        info = FrameDetectorInfo()
+        info.detector_used = False
+        if self.last_bbox is not None:
+            info.roi_xyxy = self._padded_roi(self.last_bbox, frame_hw)
+        return info
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------

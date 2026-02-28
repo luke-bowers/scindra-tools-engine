@@ -388,6 +388,14 @@ class DetectorConfig(BaseModel):
         default=10, ge=1, le=50,
         description="Number of detector debug frames to write.",
     )
+    detector_precompute_batch_size: int = Field(
+        default=8, ge=1, le=16,
+        description="Batch size for detector inference in the pre-pass (1 = no batching).",
+    )
+    precompute_detector_stride: int = Field(
+        default=1, ge=1,
+        description="Run detector only every N frames in pre-pass (1 = every scheduled frame); ROIs for in-between frames are interpolated.",
+    )
 
 
 class QCConfig(BaseModel):
@@ -444,6 +452,17 @@ class TrackCentroidConfig(BaseModel):
     debug_max_frames: int | None = Field(
         default=100, ge=1,
         description="When debug_mode is True, cap the number of debug frames written. None = no cap.",
+    )
+    overlay_scale: float = Field(
+        default=0.25,
+        ge=0.05,
+        le=1.0,
+        description="Scale factor for overlay video resolution (1.0 = full-res, 0.25 = quarter-res).",
+    )
+    heatmap_blur_ksize: int = Field(
+        default=51,
+        ge=1,
+        description="Gaussian blur kernel size for heatmap generation; must be a positive odd integer.",
     )
 
 

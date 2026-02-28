@@ -4,7 +4,7 @@ import subprocess
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Final, Callable
 
 import cv2
 import numpy as np
@@ -161,7 +161,11 @@ class FrameSampler:
     def __init__(self, reader: VideoReader) -> None:
         self._reader = reader
 
-    def sample(self, num_frames: int) -> list[tuple[int, np.ndarray]]:
+    def sample(
+        self,
+        num_frames: int,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> list[tuple[int, np.ndarray]]:
         """Return evenly spaced (frame_index, frame_bgr) pairs.
 
         The sampling is deterministic given the reader's reported frame_count.
@@ -173,10 +177,12 @@ class FrameSampler:
         total = self._reader.frame_count
         if total <= 0:
             return []
-        if num_frames >= total:
-            return list(self._reader.iter_frames())
-
-        indices = self._compute_indices(total, num_frames)
+        effective_total = min(num_frames, total)
+        indices = (
+            self._compute_indices(total, num_frames)
+            if num_frames < total
+            else list(range(total))
+        )
         result: list[tuple[int, np.ndarray]] = []
 
         target_iter = iter(indices)
@@ -194,6 +200,8 @@ class FrameSampler:
 
             if idx == next_target:
                 result.append((idx, frame))
+                if progress_callback is not None and effective_total > 0:
+                    progress_callback(len(result), effective_total)
                 try:
                     next_target = next(target_iter)
                 except StopIteration:

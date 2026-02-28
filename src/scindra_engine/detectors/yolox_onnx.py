@@ -80,6 +80,39 @@ def preprocess_frame(
     return np.expand_dims(tensor, axis=0), scale, pad
 
 
+def preprocess_frames(
+    frames_bgr: list[np.ndarray],
+    input_size: tuple[int, int],
+) -> tuple[np.ndarray, list[float], list[tuple[int, int]], list[tuple[int, int]]]:
+    """Preprocess multiple frames for batch inference.
+
+    Returns:
+        batched_tensor: shape (B, 3, H, W) float32.
+        scales: length-B list of scale factors.
+        pads: length-B list of (pad_top, pad_left).
+        orig_hw_list: length-B list of (height, width) for each frame.
+    """
+    if not frames_bgr:
+        return (
+            np.zeros((0, 3, input_size[0], input_size[1]), dtype=np.float32),
+            [],
+            [],
+            [],
+        )
+    tensors: list[np.ndarray] = []
+    scales: list[float] = []
+    pads: list[tuple[int, int]] = []
+    orig_hw_list: list[tuple[int, int]] = []
+    for frame in frames_bgr:
+        tensor, scale, pad = preprocess_frame(frame, input_size)
+        tensors.append(tensor)
+        scales.append(scale)
+        pads.append(pad)
+        orig_hw_list.append(frame.shape[:2])
+    batched = np.concatenate(tensors, axis=0)
+    return batched, scales, pads, orig_hw_list
+
+
 # ---------------------------------------------------------------------------
 # YOLOX ONNX Detector
 # ---------------------------------------------------------------------------
@@ -100,7 +133,18 @@ class YOLOXOnnxDetector:
         import onnxruntime as ort  # type: ignore[import-untyped]
 
         if providers is None:
-            providers = ["CPUExecutionProvider"]
+            # Prefer GPU (CUDA) when available, otherwise fall back to CPU.
+            available = ort.get_available_providers()
+            if "CUDAExecutionProvider" in available:
+                if "CPUExecutionProvider" in available:
+                    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                else:
+                    providers = ["CUDAExecutionProvider"]
+            elif "CPUExecutionProvider" in available:
+                providers = ["CPUExecutionProvider"]
+            else:
+                # As a last resort, let ORT decide based on whatever providers it has.
+                providers = available or ["CPUExecutionProvider"]
         self._session = ort.InferenceSession(model_path, providers=providers)
         self._meta = meta
         self._input_name: str = self._session.get_inputs()[0].name
@@ -115,14 +159,41 @@ class YOLOXOnnxDetector:
 
     def detect(self, frame_bgr: np.ndarray) -> DetectorResult:
         """Run detection on a single BGR frame."""
-        tensor, scale, pad = preprocess_frame(
-            frame_bgr, self._meta.input_size
+        results = self.detect_batch([frame_bgr])
+        return results[0]
+
+    def detect_batch(self, frames_bgr: list[np.ndarray]) -> list[DetectorResult]:
+        """Run detection on a batch of BGR frames in one session.run.
+
+        More efficient than calling detect() repeatedly when the ONNX model
+        supports a batch dimension (e.g. input shape (batch, 3, H, W)).
+        """
+        if not frames_bgr:
+            return []
+        if len(frames_bgr) == 1:
+            tensor, scale, pad = preprocess_frame(
+                frames_bgr[0], self._meta.input_size
+            )
+            outputs = self._session.run(None, {self._input_name: tensor})
+            raw = outputs[0]
+            return [
+                self._postprocess(raw, scale, pad, frames_bgr[0].shape[:2])
+            ]
+        batched, scales, pads, orig_hw_list = preprocess_frames(
+            frames_bgr, self._meta.input_size
         )
-
-        outputs = self._session.run(None, {self._input_name: tensor})
-        raw = outputs[0]  # expected (1, N, 5 + num_classes)
-
-        return self._postprocess(raw, scale, pad, frame_bgr.shape[:2])
+        try:
+            outputs = self._session.run(None, {self._input_name: batched})
+        except Exception:
+            # Model may have fixed batch size 1; fall back to per-frame
+            return [self.detect(f) for f in frames_bgr]
+        raw = outputs[0]  # (B, N, 5 + num_classes)
+        return [
+            self._postprocess(
+                raw[i : i + 1], scales[i], pads[i], orig_hw_list[i]
+            )
+            for i in range(len(frames_bgr))
+        ]
 
     # -----------------------------------------------------------------------
     # Postprocessing

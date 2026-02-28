@@ -63,6 +63,89 @@ class ThreadSafeProgressTracker:
             return (self._processed, self._total)
 
 
+class _GlobalProgress:
+    """Aggregate progress across multiple sequential phases.
+
+    Translates per-phase (done, total) updates into a single global (done, total)
+    stream suitable for the CLI progress callback. Updates are throttled in time
+    to avoid overwhelming the terminal.
+    """
+
+    def __init__(
+        self,
+        total_units: int,
+        callback: Callable[[int, int], None] | None,
+        min_interval_sec: float = 0.25,
+    ) -> None:
+        self._total_units = max(1, total_units)
+        self._callback = callback
+        self._min_interval = min_interval_sec
+        self._last_reported: int = -1
+        self._last_time: float = 0.0
+        self._phase_offset: int = 0
+
+    def start_phase(self, units: int) -> "_PhaseProgress":
+        units = max(0, units)
+        phase = _PhaseProgress(self, self._phase_offset, units)
+        self._phase_offset += units
+        return phase
+
+    def report(
+        self,
+        offset_units: int,
+        phase_units: int,
+        local_done: int,
+        local_total: int,
+    ) -> None:
+        if self._callback is None:
+            return
+        if phase_units <= 0 or local_total <= 0:
+            return
+
+        # Map local [0, local_total] -> global [offset_units, offset_units + phase_units]
+        frac = max(0.0, min(float(local_done) / float(local_total), 1.0))
+        global_done = offset_units + int(round(frac * phase_units))
+        global_done = max(0, min(global_done, self._total_units))
+
+        if global_done <= self._last_reported:
+            return
+
+        now = time.time()
+        # Throttle updates while still in-flight to avoid spamming the terminal.
+        if global_done < self._total_units and self._last_time > 0.0:
+            if (now - self._last_time) < self._min_interval:
+                return
+
+        self._last_reported = global_done
+        self._last_time = now
+        self._callback(global_done, self._total_units)
+
+    def finalize(self) -> None:
+        """Ensure a final completed update is sent."""
+        if self._callback is None:
+            return
+        if self._last_reported < self._total_units:
+            self._callback(self._total_units, self._total_units)
+            self._last_reported = self._total_units
+
+
+class _PhaseProgress:
+    """Adapter that converts per-phase progress into global progress units."""
+
+    def __init__(
+        self,
+        global_progress: _GlobalProgress,
+        offset_units: int,
+        phase_units: int,
+    ) -> None:
+        self._global = global_progress
+        self._offset_units = offset_units
+        self._phase_units = phase_units
+
+    def callback(self, done: int, total: int) -> None:
+        self._global.report(self._offset_units, self._phase_units, done, total)
+
+
 def run_track_centroid(
     video_path: Path,
     out_dir: Path,
@@ -82,34 +165,90 @@ def run_track_centroid(
 
     width = 0
     height = 0
+    total_frames = 0
 
-    with VideoReader(video_path) as reader:
-        background = _build_background(reader, config)
+    # Probe video metadata once up front (needed for progress and arena mask)
+    with VideoReader(video_path) as meta_reader:
+        total_frames = meta_reader.frame_count
         # Use actual decoded frame dimensions (handles rotation metadata mismatch)
-        width, height = reader.get_actual_dimensions()
+        width, height = meta_reader.get_actual_dimensions()
 
-    # Build arena ROI mask once (at processing resolution)
-    arena_mask = _load_or_build_arena_mask(config, height, width)
-
-    # Detector state (if enabled and a detector is provided)
+    # --- Detector + debug configuration (does not require frames) ---
     detector_state: DetectorState | None = None
     if config.detector.enabled and detector is not None:
         detector_state = DetectorState(detector, config.detector)
 
-    # Debug mode: use sequential processing and write debug frames (blob visualization)
     debug_frames_dir: Path | None = None
     if getattr(config, "debug_mode", False):
         debug_frames_dir = run_dir / "debug_frames"
         debug_frames_dir.mkdir(parents=True, exist_ok=True)
 
-    # Optional: precompute detector ROIs to enable parallel tracking
     use_precompute_parallel = (
         detector_state is not None
         and getattr(config.detector, "precompute_roi_parallel", False)
         and debug_frames_dir is None
     )
 
+    # Resolve overlay / heatmap settings and trail length once
+    overlay_enabled, heatmap_enabled, effective_trail_length = _resolve_visualization_options(
+        config=config,
+        write_overlay_video_override=write_overlay_video,
+        write_heatmap_override=write_heatmap,
+        trail_length_override=trail_length,
+    )
+
+    # Estimate work units for each phase for global progress aggregation
+    if config.preprocessing.background_model == "none":
+        background_samples = 0
+    else:
+        n_sample = config.preprocessing.background_n
+        if config.preprocessing.background_model == "mog2":
+            n_sample = max(n_sample, 50)
+        background_samples = min(n_sample, total_frames) if total_frames > 0 else n_sample
+
+    detector_pre_units = total_frames if use_precompute_parallel and total_frames > 0 else 0
+    tracking_units = total_frames if total_frames > 0 else 0
+    overlay_units = total_frames if overlay_enabled and total_frames > 0 else 0
+    heatmap_units = total_frames if heatmap_enabled and total_frames > 0 else 0
+
+    total_units = background_samples + detector_pre_units + tracking_units + overlay_units + heatmap_units
+
+    global_progress: _GlobalProgress | None = None
+    if progress_callback is not None and total_units > 0:
+        global_progress = _GlobalProgress(total_units=total_units, callback=progress_callback)
+
+    # Background model (may emit its own phase progress)
+    background_phase: _PhaseProgress | None = None
+    if global_progress is not None and background_samples > 0:
+        background_phase = global_progress.start_phase(background_samples)
+
+    with VideoReader(video_path) as reader:
+        background = _build_background(
+            reader,
+            config,
+            progress_callback=background_phase.callback if background_phase is not None else None,
+        )
+
+    # Build arena ROI mask once (at processing resolution)
+    arena_mask = _load_or_build_arena_mask(config, height, width)
+
     det_infos: list[FrameDetectorInfo] | None = None
+
+    # Phase adapters for detector pre-pass and tracking
+    detector_phase: _PhaseProgress | None = None
+    tracking_phase: _PhaseProgress | None = None
+    if global_progress is not None:
+        if detector_pre_units > 0:
+            detector_phase = global_progress.start_phase(detector_pre_units)
+        if tracking_units > 0:
+            tracking_phase = global_progress.start_phase(tracking_units)
+
+    # Choose which callback to use for tracking depending on whether we are aggregating phases
+    tracking_progress_cb: Callable[[int, int], None] | None
+    if tracking_phase is not None:
+        tracking_progress_cb = tracking_phase.callback
+    else:
+        tracking_progress_cb = progress_callback
 
     if debug_frames_dir is not None or (detector_state is not None and not use_precompute_parallel):
         # Sequential: required for debug frames or (by default) detector-assisted mode
@@ -118,7 +257,7 @@ def run_track_centroid(
                 reader,
                 config,
                 background,
-                progress_callback,
+                tracking_progress_cb,
                 arena_mask=arena_mask,
                 debug_frames_dir=debug_frames_dir,
                 debug_frame_interval=getattr(config, "debug_frame_interval", 30),
@@ -132,14 +271,26 @@ def run_track_centroid(
 
         # When using detector-assisted parallel mode, first build a per-frame ROI schedule
         if use_precompute_parallel and detector_state is not None:
-            det_infos = _precompute_detector_infos(video_path, detector_state)
+            batch_size = getattr(
+                config.detector, "detector_precompute_batch_size", 8
+            )
+            stride = getattr(
+                config.detector, "precompute_detector_stride", 1
+            )
+            det_infos = _precompute_detector_infos(
+                video_path,
+                detector_state,
+                progress_callback=detector_phase.callback if detector_phase is not None else None,
+                batch_size=batch_size,
+                stride=stride,
+            )
 
         try:
             points = _track_video_parallel(
                 video_path,
                 config,
                 background,
-                progress_callback,
+                tracking_progress_cb,
                 num_workers=effective_workers,
                 chunk_size=effective_chunk_size,
                 arena_mask=arena_mask,
@@ -152,7 +303,7 @@ def run_track_centroid(
                     reader,
                     config,
                     background,
-                    progress_callback,
+                    tracking_progress_cb,
                     arena_mask=arena_mask,
                     detector_state=detector_state,
                 )
@@ -170,37 +321,75 @@ def run_track_centroid(
     summary_path = run_dir / "tracking_summary.json"
     summary_path.write_text(json.dumps(run_meta, indent=2), encoding="utf-8")
 
-    overlay_enabled, heatmap_enabled, effective_trail_length = (
-        _resolve_visualization_options(
-            config=config,
-            write_overlay_video_override=write_overlay_video,
-            write_heatmap_override=write_heatmap,
-            trail_length_override=trail_length,
-        )
-    )
+    # Phases for overlay and heatmap (if enabled)
+    overlay_phase: _PhaseProgress | None = None
+    heatmap_phase: _PhaseProgress | None = None
+    if global_progress is not None:
+        if overlay_units > 0:
+            overlay_phase = global_progress.start_phase(overlay_units)
+        if heatmap_units > 0:
+            heatmap_phase = global_progress.start_phase(heatmap_units)
 
-    if overlay_enabled:
-        require_ffmpeg_available()
-        overlay_path = run_dir / "overlay.mp4"
-        _write_overlay_video(
-            str(video_path),
-            points,
-            str(overlay_path),
-            trail_length=effective_trail_length,
-        )
-        # Match input display aspect ratio so the overlay doesn't look stretched/squashed
-        fix_video_display_aspect_ratio(overlay_path, video_path)
-
-    if heatmap_enabled:
+    # Run overlay and heatmap in parallel when both are enabled; otherwise run singly
+    if overlay_enabled and heatmap_enabled:
         if width <= 0 or height <= 0:
             raise RuntimeError("Video dimensions are not available for heatmap output")
+        require_ffmpeg_available()
+        overlay_path = run_dir / "overlay.mp4"
         heatmap_path = run_dir / "heatmap.png"
-        write_heatmap_png(
-            width=width,
-            height=height,
-            track_points=points,
-            out_path=str(heatmap_path),
-        )
+        overlay_scale = getattr(config, "overlay_scale", 0.25)
+        heatmap_blur_ksize = getattr(config, "heatmap_blur_ksize", 51)
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            future_overlay = ex.submit(
+                _write_overlay_video,
+                str(video_path),
+                points,
+                str(overlay_path),
+                trail_length=effective_trail_length,
+                scale=overlay_scale,
+                progress_callback=overlay_phase.callback if overlay_phase is not None else None,
+            )
+            future_heatmap = ex.submit(
+                write_heatmap_png,
+                width,
+                height,
+                points,
+                str(heatmap_path),
+                blur_ksize=heatmap_blur_ksize,
+                progress_callback=heatmap_phase.callback if heatmap_phase is not None else None,
+            )
+            future_overlay.result()
+            future_heatmap.result()
+        fix_video_display_aspect_ratio(overlay_path, video_path)
+        if overlay_phase is not None:
+            overlay_phase.callback(overlay_units, overlay_units)
+        if heatmap_phase is not None:
+            heatmap_phase.callback(heatmap_units, heatmap_units)
+    else:
+        if overlay_enabled:
+            require_ffmpeg_available()
+            overlay_path = run_dir / "overlay.mp4"
+            _write_overlay_video(
+                str(video_path),
+                points,
+                str(overlay_path),
+                trail_length=effective_trail_length,
+                scale=getattr(config, "overlay_scale", 0.25),
+                progress_callback=overlay_phase.callback if overlay_phase is not None else None,
+            )
+            fix_video_display_aspect_ratio(overlay_path, video_path)
+        if heatmap_enabled:
+            if width <= 0 or height <= 0:
+                raise RuntimeError("Video dimensions are not available for heatmap output")
+            heatmap_path = run_dir / "heatmap.png"
+            write_heatmap_png(
+                width=width,
+                height=height,
+                track_points=points,
+                out_path=str(heatmap_path),
+                blur_ksize=getattr(config, "heatmap_blur_ksize", 51),
+                progress_callback=heatmap_phase.callback if heatmap_phase is not None else None,
+            )
 
     # Detector debug frames (sampled bbox overlays)
     if (
@@ -215,6 +404,9 @@ def run_track_centroid(
             out_dir=run_dir / "debug_frames",
             max_frames=config.detector.detector_debug_frame_count,
         )
+
+    if global_progress is not None:
+        global_progress.finalize()
 
     return TrackCentroidResult(run_dir=run_dir, points=points, summary=run_meta)
 
@@ -296,7 +488,9 @@ def _create_scaled_tracking_config(
 
 
 def _build_background(
-    reader: VideoReader, config: TrackCentroidConfig
+    reader: VideoReader,
+    config: TrackCentroidConfig,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> BackgroundModel | None:
     if config.preprocessing.background_model == "none":
         return None
@@ -307,7 +501,7 @@ def _build_background(
     if config.preprocessing.background_model == "mog2":
         n_sample = max(n_sample, 50)
 
-    frames = [frame for _, frame in sampler.sample(n_sample)]
+    frames = [frame for _, frame in sampler.sample(n_sample, progress_callback=progress_callback)]
     
     # Downsample frames if downsampling is enabled
     if config.downsample_factor is not None and config.downsample_factor > 1.0:
@@ -316,26 +510,130 @@ def _build_background(
     return build_background(frames, config.preprocessing)
 
 
+def _interpolate_roi(
+    roi_a: tuple[int, int, int, int],
+    roi_b: tuple[int, int, int, int],
+    t: float,
+) -> tuple[int, int, int, int]:
+    """Linear interpolation between two ROIs (x1, y1, x2, y2). t in [0, 1]."""
+    x1 = int(round(roi_a[0] + t * (roi_b[0] - roi_a[0])))
+    y1 = int(round(roi_a[1] + t * (roi_b[1] - roi_a[1])))
+    x2 = int(round(roi_a[2] + t * (roi_b[2] - roi_a[2])))
+    y2 = int(round(roi_a[3] + t * (roi_b[3] - roi_a[3])))
+    return (x1, y1, x2, y2)
+
+
 def _precompute_detector_infos(
     video_path: Path,
     detector_state: DetectorState,
+    progress_callback: Callable[[int, int], None] | None = None,
+    batch_size: int = 8,
+    stride: int = 1,
 ) -> list[FrameDetectorInfo]:
     """Run the detector in a pre-pass to build a per-frame ROI schedule.
 
-    This pass is lightweight compared to full tracking (no preprocessing or
-    segmentation), and it enables parallel chunked tracking to use a
-    detector-guided ROI without invoking the detector inside each worker.
+    When batch_size > 1, runs batched inference for speed. When stride > 1,
+    runs detector only every stride frames and interpolates ROIs in between.
     """
-    det_infos: list[FrameDetectorInfo] = []
+    detector = detector_state._detector
+    has_batch = hasattr(detector, "detect_batch") and batch_size > 1
+
+    # Pass 1: collect frames where we should run detector (optionally strided); run in batches
+    stored_infos: dict[int, FrameDetectorInfo] = {}
+    buffer: list[tuple[int, np.ndarray, tuple[int, int]]] = []
+
+    def flush_buffer() -> None:
+        if not buffer:
+            return
+        frames = [b[1] for b in buffer]
+        if has_batch:
+            results = detector.detect_batch(frames)
+            for (idx, _, frame_hw), result in zip(buffer, results):
+                info = detector_state.apply_detection_result(result, frame_hw)
+                stored_infos[idx] = info
+        else:
+            for (idx, frame_bgr, _) in buffer:
+                info = detector_state.step(
+                    frame_bgr=frame_bgr,
+                    frame_idx=idx,
+                    tracking_conf=1.0,
+                    has_centroid=True,
+                )
+                stored_infos[idx] = info
+        buffer.clear()
+
+    with VideoReader(video_path) as reader:
+        total = reader.frame_count
+        for idx, frame in reader.iter_frames():
+            if detector_state.should_run(idx, 1.0, True) and (
+                stride <= 1 or idx % stride == 0
+            ):
+                buffer.append((idx, frame.copy(), frame.shape[:2]))
+                if len(buffer) >= batch_size:
+                    flush_buffer()
+            if progress_callback is not None and total > 0:
+                progress_callback(idx + 1, total)
+        flush_buffer()
+
+    detector_frame_indices = sorted(stored_infos.keys()) if stored_infos else []
+
+    # Pass 2: build det_infos in frame order; interpolate ROI when stride > 1
+    det_infos = []
     with VideoReader(video_path) as reader:
         for idx, frame in reader.iter_frames():
-            info = detector_state.step(
-                frame_bgr=frame,
-                frame_idx=idx,
-                tracking_conf=1.0,
-                has_centroid=True,
-            )
-            det_infos.append(info)
+            frame_hw = frame.shape[:2]
+            if idx in stored_infos:
+                det_infos.append(stored_infos[idx])
+            else:
+                detector_state.frames_since_detect += 1
+                if stride > 1 and len(detector_frame_indices) >= 2:
+                    # Interpolate between nearest detector frames
+                    prev_list = [i for i in detector_frame_indices if i < idx]
+                    next_list = [i for i in detector_frame_indices if i > idx]
+                    prev_idx = max(prev_list) if prev_list else None
+                    next_idx = min(next_list) if next_list else None
+                    if prev_idx is not None and next_idx is not None:
+                        roi_prev = stored_infos[prev_idx].roi_xyxy
+                        roi_next = stored_infos[next_idx].roi_xyxy
+                        if roi_prev is not None and roi_next is not None:
+                            t = (idx - prev_idx) / (next_idx - prev_idx)
+                            interp = _interpolate_roi(roi_prev, roi_next, t)
+                            det_infos.append(
+                                FrameDetectorInfo(
+                                    roi_xyxy=interp,
+                                    detector_used=False,
+                                )
+                            )
+                        else:
+                            det_infos.append(
+                                detector_state.info_for_frame_without_run(
+                                    frame_hw
+                                )
+                            )
+                    elif prev_idx is not None and stored_infos[prev_idx].roi_xyxy is not None:
+                        det_infos.append(
+                            FrameDetectorInfo(
+                                roi_xyxy=stored_infos[prev_idx].roi_xyxy,
+                                detector_used=False,
+                            )
+                        )
+                    elif next_idx is not None and stored_infos[next_idx].roi_xyxy is not None:
+                        det_infos.append(
+                            FrameDetectorInfo(
+                                roi_xyxy=stored_infos[next_idx].roi_xyxy,
+                                detector_used=False,
+                            )
+                        )
+                    else:
+                        det_infos.append(
+                            detector_state.info_for_frame_without_run(
+                                frame_hw
+                            )
+                        )
+                else:
+                    det_infos.append(
+                        detector_state.info_for_frame_without_run(frame_hw)
+                    )
     return det_infos
 
 
