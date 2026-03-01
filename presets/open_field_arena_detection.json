@@ -26,12 +26,12 @@
     "n_frames_static": 50,
     "static_method": "median",
     "detection_method": "contour",
-    "margin_px": 0,
-    "morph_close_ksize": 25,
-    "min_area_ratio": 0.05,
-    "canny_low": 10,
-    "debug_output_dir": "out/debug_arena",
-    "use_hough_circle": false
+    "arena_type": "open_field",
+    "open_field_white_threshold": 180,
+    "open_field_min_area_ratio": 0.008,
+    "open_field_rectangularity_min": 0.5,
+    "margin_px": 2,
+    "debug_output_dir": "out/debug_arena"
   },
   "debug_mode": true,
   "debug_frame_interval": 30,

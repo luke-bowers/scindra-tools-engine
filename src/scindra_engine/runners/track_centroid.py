@@ -297,12 +297,19 @@ def run_track_centroid(
                     img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
                 out_img = resize_to_display_aspect(img, dar)
                 cv2.imwrite(str(arena_debug_dir / f"arena_debug_{step}.png"), out_img)
-            entry = {k: v for k, v in data.items() if k != "image"}
+            if step == "open_field" and arena_debug_dir is not None:
+                mask = data.get("mask")
+                if mask is not None and isinstance(mask, np.ndarray):
+                    mask_vis = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+                    mask_out = resize_to_display_aspect(mask_vis, dar)
+                    cv2.imwrite(str(arena_debug_dir / "arena_debug_open_field_mask.png"), mask_out)
+            entry = {k: v for k, v in data.items() if k not in ("image", "mask")}
             entry["step"] = step
             arena_debug_manifest.append(entry)
 
         if arena_debug_dir is not None:
             arena_debug_dir.mkdir(parents=True, exist_ok=True)
+        arena_type_val = getattr(arena_crop_config, "arena_type", "elevated_zero")
         box, chosen_circle = detect_arena_crop_xyxy(
             static_img,
             margin_px=arena_crop_config.margin_px,
@@ -321,6 +328,10 @@ def run_track_centroid(
             force_square_crop=getattr(arena_crop_config, "force_square_crop", True),
             debug_callback=_arena_debug_cb if arena_debug_dir is not None else None,
             dar=dar,
+            arena_type=arena_type_val,
+            open_field_white_threshold=getattr(arena_crop_config, "open_field_white_threshold", 200),
+            open_field_min_area_ratio=getattr(arena_crop_config, "open_field_min_area_ratio", 0.02),
+            open_field_rectangularity_min=getattr(arena_crop_config, "open_field_rectangularity_min", 0.6),
         )
         if arena_debug_dir is not None:
             (arena_debug_dir / "arena_debug_manifest.json").write_text(
@@ -2133,6 +2144,7 @@ def _write_arena_crop_info(
     min_area_ratio = getattr(arena_crop_config, "min_area_ratio", 0.05)
     min_area_px = max(100, int(area_total * min_area_ratio))
     params = {
+        "arena_type": getattr(arena_crop_config, "arena_type", "elevated_zero"),
         "canny_low": getattr(arena_crop_config, "canny_low", 50),
         "canny_high": getattr(arena_crop_config, "canny_high", 150),
         "blur_ksize": getattr(arena_crop_config, "blur_ksize", 5),
@@ -2145,6 +2157,10 @@ def _write_arena_crop_info(
         "min_area_px": min_area_px,
         "margin_px": getattr(arena_crop_config, "margin_px", 0),
     }
+    if getattr(arena_crop_config, "arena_type", "elevated_zero") == "open_field":
+        params["open_field_white_threshold"] = getattr(arena_crop_config, "open_field_white_threshold", 200)
+        params["open_field_min_area_ratio"] = getattr(arena_crop_config, "open_field_min_area_ratio", 0.02)
+        params["open_field_rectangularity_min"] = getattr(arena_crop_config, "open_field_rectangularity_min", 0.6)
     if crop_xyxy is not None:
         data = {
             "applied": True,

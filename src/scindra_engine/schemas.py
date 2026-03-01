@@ -159,6 +159,28 @@ class ArenaCropConfig(BaseModel):
         default="contour",
         description="Arena detection method (classical contour-based).",
     )
+    arena_type: Literal["elevated_zero", "open_field"] = Field(
+        default="elevated_zero",
+        description="elevated_zero: circular/ring mazes (edge-based + Hough/contour). open_field: white rectangular box (brightness threshold + largest region).",
+    )
+    open_field_white_threshold: int = Field(
+        default=200,
+        ge=0,
+        le=255,
+        description="Open-field only: grayscale value above which pixels are white (0 = use Otsu auto threshold).",
+    )
+    open_field_min_area_ratio: float = Field(
+        default=0.02,
+        ge=0.0,
+        le=1.0,
+        description="Open-field only: minimum contour area as fraction of frame area.",
+    )
+    open_field_rectangularity_min: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description="Open-field only: min contour_area/bbox_area to prefer box-like shapes.",
+    )
     margin_px: int = Field(
         default=0,
         description="Pixels to add to each side of detected box (negative = shrink).",

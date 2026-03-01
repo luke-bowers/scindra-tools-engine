@@ -170,6 +170,9 @@ def arena_crop_test(
     hough_max_radius_ratio: float | None = typer.Option(None, "--hough-max-radius", min=0.1, max=0.99, help="Hough max radius as fraction of min(w,h)"),
     hough_acc_threshold: int | None = typer.Option(None, "--hough-acc-threshold", min=5, max=100, help="Hough accumulator threshold; lower = more sensitive"),
     circle_only: bool = typer.Option(False, "--circle-only/--contour-fallback", help="Only use circle detection; no contour fallback"),
+    arena_type: str | None = typer.Option(None, "--arena-type", help="Arena type: elevated-zero (circular/ring) or open-field (white box). Overrides config."),
+    open_field_white_threshold: int | None = typer.Option(None, "--open-field-white-threshold", min=0, max=255, help="Open-field only: grayscale threshold for white (0=Otsu). Overrides config."),
+    open_field_min_area_ratio: float | None = typer.Option(None, "--open-field-min-area-ratio", min=0.0, max=1.0, help="Open-field only: min contour area as fraction of frame. Overrides config."),
     debug_out: Path | None = typer.Option(None, "--debug-out", file_okay=False, help="Write pipeline step images and manifest to this directory (what the pipeline sees at each step)"),
 ) -> None:
     """Test arena detection on a video or single image without running full tracking.
@@ -216,6 +219,10 @@ def arena_crop_test(
     hough_center_margin_val = 0.15
     hough_acc_threshold_val = 25
     circle_only_val = False
+    arena_type_val = "elevated_zero"
+    open_field_white_threshold_val = 200
+    open_field_min_area_ratio_val = 0.02
+    open_field_rectangularity_min_val = 0.6
     if config_path is not None:
         data = _load_config(config_path)
         try:
@@ -236,6 +243,10 @@ def arena_crop_test(
             hough_center_margin_val = getattr(ac, "hough_center_margin_ratio", 0.15)
             hough_acc_threshold_val = getattr(ac, "hough_acc_threshold", 25)
             circle_only_val = getattr(ac, "circle_only", False)
+            arena_type_val = getattr(ac, "arena_type", "elevated_zero")
+            open_field_white_threshold_val = getattr(ac, "open_field_white_threshold", 200)
+            open_field_min_area_ratio_val = getattr(ac, "open_field_min_area_ratio", 0.02)
+            open_field_rectangularity_min_val = getattr(ac, "open_field_rectangularity_min", 0.6)
         except Exception as e:
             typer.echo(f"Warning: could not load arena_crop from config: {e}", err=True)
     if canny_low is not None:
@@ -262,6 +273,16 @@ def arena_crop_test(
         hough_acc_threshold_val = hough_acc_threshold
     if circle_only:
         circle_only_val = True
+    if arena_type is not None:
+        at = arena_type.strip().lower().replace("-", "_")
+        if at in ("elevated_zero", "open_field"):
+            arena_type_val = at
+        else:
+            typer.echo(f"Warning: --arena-type must be elevated-zero or open-field (got {arena_type!r}), using {arena_type_val!r}", err=True)
+    if open_field_white_threshold is not None:
+        open_field_white_threshold_val = open_field_white_threshold
+    if open_field_min_area_ratio is not None:
+        open_field_min_area_ratio_val = open_field_min_area_ratio
 
     dar: str | None = None
     if video is not None:
@@ -305,7 +326,13 @@ def arena_crop_test(
             out_img = resize_to_display_aspect(img, dar) if dar else img
             path = debug_out / f"arena_debug_{step}.png"
             cv2.imwrite(str(path), out_img)
-        manifest_entry = {k: v for k, v in data.items() if k != "image"}
+        if step == "open_field" and debug_out is not None:
+            mask = data.get("mask")
+            if mask is not None and hasattr(mask, "ndim"):
+                mask_vis = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+                mask_out = resize_to_display_aspect(mask_vis, dar) if dar else mask_vis
+                cv2.imwrite(str(debug_out / "arena_debug_open_field_mask.png"), mask_out)
+        manifest_entry = {k: v for k, v in data.items() if k not in ("image", "mask")}
         manifest_entry["step"] = step
         debug_manifest.append(manifest_entry)
 
@@ -327,6 +354,10 @@ def arena_crop_test(
         force_square_crop=force_square_crop_val,
         debug_callback=_arena_debug_callback if debug_out is not None else None,
         dar=dar,
+        arena_type=arena_type_val,
+        open_field_white_threshold=open_field_white_threshold_val,
+        open_field_min_area_ratio=open_field_min_area_ratio_val,
+        open_field_rectangularity_min=open_field_rectangularity_min_val,
     )
     if box is not None and crop_expand_ratio_val > 0:
         h, w = static_img.shape[:2]
@@ -344,6 +375,7 @@ def arena_crop_test(
     result = {
         "applied": box is not None,
         "params": {
+            "arena_type": arena_type_val,
             "canny_low": canny_low_val,
             "canny_high": canny_high_val,
             "blur_ksize": blur_ksize_val,
@@ -356,9 +388,15 @@ def arena_crop_test(
             "min_area_px": min_area_px,
             "margin_px": margin_px_val,
         },
+    }
+    if arena_type_val == "open_field":
+        result["params"]["open_field_white_threshold"] = open_field_white_threshold_val
+        result["params"]["open_field_min_area_ratio"] = open_field_min_area_ratio_val
+        result["params"]["open_field_rectangularity_min"] = open_field_rectangularity_min_val
+    result.update({
         "static_image": "arena_crop_static.png",
         "edges_image": "arena_crop_edges.png",
-    }
+    })
     if morph_close_ksize_val > 0:
         result["edges_closed_image"] = "arena_crop_edges_closed.png"
     if box is not None:

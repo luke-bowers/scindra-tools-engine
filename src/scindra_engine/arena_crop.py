@@ -220,6 +220,70 @@ def _detect_arena_contour(
     return ((int(x1), int(y1), int(x2), int(y2)), areas, chosen_bbox)
 
 
+def _detect_arena_open_field(
+    static_image_bgr: np.ndarray,
+    w: int,
+    h: int,
+    margin_px: int,
+    blur_ksize: int,
+    open_field_white_threshold: int,
+    open_field_min_area_ratio: float,
+    open_field_rectangularity_min: float,
+) -> tuple[tuple[int, int, int, int] | None, np.ndarray, tuple[int, int, int, int] | None]:
+    """Detect open-field arena as largest bright (white) region. Returns (box, mask, chosen_bbox)."""
+    gray = (
+        cv2.cvtColor(static_image_bgr, cv2.COLOR_BGR2GRAY)
+        if static_image_bgr.ndim == 3
+        else static_image_bgr
+    )
+    k = max(1, blur_ksize if blur_ksize % 2 == 1 else blur_ksize + 1)
+    blurred = cv2.GaussianBlur(gray, (k, k), 0)
+    if open_field_white_threshold > 0:
+        _, binary = cv2.threshold(
+            blurred, open_field_white_threshold, 255, cv2.THRESH_BINARY
+        )
+    else:
+        _, binary = cv2.threshold(
+            blurred, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU
+        )
+    # Light morphology: close with small kernel to fill tiny holes inside the box but not bridge a thin gap (e.g. between maze and tiles to the right)
+    close_k = 3
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    contours, _ = cv2.findContours(
+        binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    area_total = w * h
+    min_area = max(100, int(area_total * open_field_min_area_ratio))
+    candidates = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < min_area:
+            continue
+        x1, y1, cw, ch = cv2.boundingRect(c)
+        bbox_area = cw * ch
+        if bbox_area <= 0:
+            continue
+        rectangularity = area / bbox_area
+        if rectangularity >= open_field_rectangularity_min:
+            candidates.append((c, area, rectangularity))
+    if not candidates:
+        return (None, binary, None)
+    # Prefer large and box-like: score = area * rectangularity so maze wins over merged maze+tiles
+    best_contour = max(candidates, key=lambda x: x[1] * x[2])[0]
+    x1, y1, cw, ch = cv2.boundingRect(best_contour)
+    x2 = x1 + cw
+    y2 = y1 + ch
+    x1 = max(0, x1 - margin_px)
+    y1 = max(0, y1 - margin_px)
+    x2 = min(w, x2 + margin_px)
+    y2 = min(h, y2 + margin_px)
+    if x2 <= x1 or y2 <= y1:
+        return (None, binary, None)
+    chosen_bbox = (int(x1), int(y1), int(x2), int(y2))
+    return ((int(x1), int(y1), int(x2), int(y2)), binary, chosen_bbox)
+
+
 def detect_arena_crop_xyxy(
     static_image_bgr: np.ndarray,
     margin_px: int = 0,
@@ -238,6 +302,10 @@ def detect_arena_crop_xyxy(
     force_square_crop: bool = True,
     debug_callback: Callable[[str, dict[str, Any]], None] | None = None,
     dar: str | None = None,
+    arena_type: str = "elevated_zero",
+    open_field_white_threshold: int = 200,
+    open_field_min_area_ratio: float = 0.02,
+    open_field_rectangularity_min: float = 0.6,
 ) -> tuple[tuple[int, int, int, int] | None, tuple[int, int, int] | None]:
     """Detect the most likely arena bounding box from a static BGR image.
 
@@ -289,6 +357,41 @@ def detect_arena_crop_xyxy(
         (box, chosen_circle): box is (x1, y1, x2, y2) or None; chosen_circle is (cx, cy, r) when from Hough, else None.
     """
     h, w = static_image_bgr.shape[:2]
+
+    # Open-field path: segment white region, largest contour → bbox
+    if arena_type == "open_field":
+        box, mask, chosen_bbox = _detect_arena_open_field(
+            static_image_bgr,
+            w,
+            h,
+            margin_px,
+            blur_ksize,
+            open_field_white_threshold,
+            open_field_min_area_ratio,
+            open_field_rectangularity_min,
+        )
+        if debug_callback is not None:
+            overlay = static_image_bgr.copy()
+            if chosen_bbox is not None:
+                x1, y1, x2, y2 = chosen_bbox
+                cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(
+                    overlay,
+                    "Arena crop (detected)",
+                    (x1, max(20, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+            debug_callback("open_field", {
+                "image": overlay,
+                "mask": mask,
+                "chosen_bbox": list(chosen_bbox) if chosen_bbox else None,
+                "description": "Open-field: white region mask; green box = chosen crop",
+            })
+        return (box, None)
 
     # Step: edges (optionally show raw edges before morph)
     if morph_close_ksize > 0 and debug_callback is not None:
