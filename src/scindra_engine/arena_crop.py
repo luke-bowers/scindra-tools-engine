@@ -220,41 +220,30 @@ def _detect_arena_contour(
     return ((int(x1), int(y1), int(x2), int(y2)), areas, chosen_bbox)
 
 
-def _detect_arena_open_field(
-    static_image_bgr: np.ndarray,
+def _detect_arena_open_field_single_threshold(
+    blurred: np.ndarray,
     w: int,
     h: int,
-    margin_px: int,
-    blur_ksize: int,
-    open_field_white_threshold: int,
+    threshold: int,
     open_field_min_area_ratio: float,
     open_field_rectangularity_min: float,
-) -> tuple[tuple[int, int, int, int] | None, np.ndarray, tuple[int, int, int, int] | None]:
-    """Detect open-field arena as largest bright (white) region. Returns (box, mask, chosen_bbox)."""
-    gray = (
-        cv2.cvtColor(static_image_bgr, cv2.COLOR_BGR2GRAY)
-        if static_image_bgr.ndim == 3
-        else static_image_bgr
-    )
-    k = max(1, blur_ksize if blur_ksize % 2 == 1 else blur_ksize + 1)
-    blurred = cv2.GaussianBlur(gray, (k, k), 0)
-    if open_field_white_threshold > 0:
-        _, binary = cv2.threshold(
-            blurred, open_field_white_threshold, 255, cv2.THRESH_BINARY
-        )
+    use_otsu: bool = False,
+) -> list[tuple]:
+    """Helper function to detect candidates with a single threshold strategy."""
+    if use_otsu:
+        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
     else:
-        _, binary = cv2.threshold(
-            blurred, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU
-        )
-    # Light morphology: close with small kernel to fill tiny holes inside the box but not bridge a thin gap (e.g. between maze and tiles to the right)
+        _, binary = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY)
+    
+    # Light morphology: close with small kernel to fill tiny holes
     close_k = 3
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-    contours, _ = cv2.findContours(
-        binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
+    
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     area_total = w * h
     min_area = max(100, int(area_total * open_field_min_area_ratio))
+    
     candidates = []
     for c in contours:
         area = cv2.contourArea(c)
@@ -266,22 +255,202 @@ def _detect_arena_open_field(
             continue
         rectangularity = area / bbox_area
         if rectangularity >= open_field_rectangularity_min:
-            candidates.append((c, area, rectangularity))
-    if not candidates:
-        return (None, binary, None)
-    # Prefer large and box-like: score = area * rectangularity so maze wins over merged maze+tiles
-    best_contour = max(candidates, key=lambda x: x[1] * x[2])[0]
-    x1, y1, cw, ch = cv2.boundingRect(best_contour)
+            # Calculate position score (prefer centered regions)
+            center_x, center_y = x1 + cw // 2, y1 + ch // 2
+            frame_center_x, frame_center_y = w // 2, h // 2
+            distance_from_center = ((center_x - frame_center_x) ** 2 + (center_y - frame_center_y) ** 2) ** 0.5
+            max_distance = ((frame_center_x) ** 2 + (frame_center_y) ** 2) ** 0.5
+            position_score = 1.0 - (distance_from_center / max_distance)
+            
+            # Calculate aspect ratio score (prefer square regions)
+            aspect_ratio = max(cw, ch) / min(cw, ch)
+            aspect_score = 1.0 / aspect_ratio  # Closer to 1.0 = more square
+            
+            candidates.append((c, area, rectangularity, position_score, aspect_score, x1, y1, cw, ch, binary))
+    
+    return candidates
+
+
+def _detect_arena_open_field(
+    static_image_bgr: np.ndarray,
+    w: int,
+    h: int,
+    margin_px: int,
+    blur_ksize: int,
+    open_field_white_threshold: int,
+    open_field_min_area_ratio: float,
+    open_field_rectangularity_min: float,
+    debug_callback: Callable[[str, dict[str, Any]], None] | None = None,
+) -> tuple[tuple[int, int, int, int] | None, np.ndarray, tuple[int, int, int, int] | None]:
+    """Detect open-field arena with cascading threshold strategy. Returns (box, mask, chosen_bbox)."""
+    gray = (
+        cv2.cvtColor(static_image_bgr, cv2.COLOR_BGR2GRAY)
+        if static_image_bgr.ndim == 3
+        else static_image_bgr
+    )
+    k = max(1, blur_ksize if blur_ksize % 2 == 1 else blur_ksize + 1)
+    blurred = cv2.GaussianBlur(gray, (k, k), 0)
+    
+    all_candidates = []
+    final_binary = None
+    strategy_results = {}
+    
+    # Strategy 1: High threshold for bright arenas (avoids background noise)
+    if open_field_white_threshold > 0:
+        candidates = _detect_arena_open_field_single_threshold(
+            blurred, w, h, open_field_white_threshold, 
+            open_field_min_area_ratio, open_field_rectangularity_min
+        )
+        if candidates:
+            all_candidates.extend([(c, "high_threshold") for c in candidates])
+            final_binary = candidates[0][-1]  # Use binary from first strategy
+            strategy_results["high_threshold"] = (len(candidates), candidates[0][-1])
+            
+            if debug_callback is not None:
+                overlay = static_image_bgr.copy()
+                for i, candidate in enumerate(candidates[:3]):  # Show up to 3 candidates
+                    c, area, rectangularity, position_score, aspect_score, x1, y1, cw, ch, binary = candidate
+                    color = [(0, 255, 0), (0, 255, 255), (255, 0, 255)][i]  # Green, Cyan, Magenta
+                    cv2.rectangle(overlay, (x1, y1), (x1 + cw, y1 + ch), color, 2)
+                    cv2.putText(overlay, f"HT{i+1}: {int(area)}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                debug_callback("open_field_high_threshold", {
+                    "image": overlay,
+                    "mask": candidates[0][-1],
+                    "candidates_count": len(candidates),
+                    "threshold": open_field_white_threshold,
+                    "description": f"Strategy 1 - High threshold ({open_field_white_threshold}): Found {len(candidates)} candidates",
+                })
+    
+    # Strategy 2: Auto threshold (Otsu) for varied lighting - more permissive
+    if not all_candidates or open_field_white_threshold == 0:
+        candidates = _detect_arena_open_field_single_threshold(
+            blurred, w, h, 0, 
+            max(0.003, open_field_min_area_ratio * 0.6),  # More permissive area
+            max(0.4, open_field_rectangularity_min * 0.8),  # More permissive rectangularity
+            use_otsu=True
+        )
+        if candidates:
+            all_candidates.extend([(c, "auto_threshold") for c in candidates])
+            if final_binary is None:
+                final_binary = candidates[0][-1]
+            strategy_results["auto_threshold"] = (len(candidates), candidates[0][-1])
+            
+            if debug_callback is not None:
+                overlay = static_image_bgr.copy()
+                for i, candidate in enumerate(candidates[:3]):  # Show up to 3 candidates
+                    c, area, rectangularity, position_score, aspect_score, x1, y1, cw, ch, binary = candidate
+                    color = [(0, 255, 0), (0, 255, 255), (255, 0, 255)][i]
+                    cv2.rectangle(overlay, (x1, y1), (x1 + cw, y1 + ch), color, 2)
+                    cv2.putText(overlay, f"AT{i+1}: {int(area)}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                debug_callback("open_field_auto_threshold", {
+                    "image": overlay,
+                    "mask": candidates[0][-1],
+                    "candidates_count": len(candidates),
+                    "description": f"Strategy 2 - Auto threshold (Otsu): Found {len(candidates)} candidates",
+                })
+    
+    # Strategy 3: Very low threshold for dark arenas - most permissive
+    if not all_candidates:
+        candidates = _detect_arena_open_field_single_threshold(
+            blurred, w, h, 100,
+            max(0.002, open_field_min_area_ratio * 0.4),  # Very permissive
+            max(0.3, open_field_rectangularity_min * 0.7),  # Very permissive
+        )
+        if candidates:
+            all_candidates.extend([(c, "low_threshold") for c in candidates])
+            if final_binary is None:
+                final_binary = candidates[0][-1]
+            strategy_results["low_threshold"] = (len(candidates), candidates[0][-1])
+            
+            if debug_callback is not None:
+                overlay = static_image_bgr.copy()
+                for i, candidate in enumerate(candidates[:3]):  # Show up to 3 candidates
+                    c, area, rectangularity, position_score, aspect_score, x1, y1, cw, ch, binary = candidate
+                    color = [(0, 255, 0), (0, 255, 255), (255, 0, 255)][i]
+                    cv2.rectangle(overlay, (x1, y1), (x1 + cw, y1 + ch), color, 2)
+                    cv2.putText(overlay, f"LT{i+1}: {int(area)}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                debug_callback("open_field_low_threshold", {
+                    "image": overlay,
+                    "mask": candidates[0][-1],
+                    "candidates_count": len(candidates),
+                    "threshold": 100,
+                    "description": f"Strategy 3 - Low threshold (100): Found {len(candidates)} candidates",
+                })
+    
+    if not all_candidates:
+        if debug_callback is not None:
+            debug_callback("open_field_no_candidates", {
+                "image": static_image_bgr,
+                "mask": blurred if final_binary is None else final_binary,
+                "description": "No candidates found in any strategy",
+            })
+        return (None, blurred if final_binary is None else final_binary, None)
+    
+    # Select best candidate using composite scoring
+    def score_candidate(candidate_info):
+        candidate, strategy = candidate_info
+        c, area, rectangularity, position_score, aspect_score, x1, y1, cw, ch, binary = candidate
+        
+        # Strategy bonus: prefer high-threshold results (cleaner detection)
+        strategy_bonus = {"high_threshold": 1.2, "auto_threshold": 1.0, "low_threshold": 0.8}[strategy]
+        
+        # Composite score: area * rectangularity * position * aspect * strategy_bonus
+        composite_score = area * rectangularity * position_score * aspect_score * strategy_bonus
+        
+        return composite_score
+    
+    best_candidate_info = max(all_candidates, key=score_candidate)
+    best_candidate, best_strategy = best_candidate_info
+    c, area, rectangularity, position_score, aspect_score, x1, y1, cw, ch, binary = best_candidate
+    
+    # Debug final selection
+    if debug_callback is not None:
+        overlay = static_image_bgr.copy()
+        cv2.rectangle(overlay, (x1, y1), (x1 + cw, y1 + ch), (0, 255, 0), 3)
+        cv2.putText(
+            overlay,
+            f"CHOSEN: {best_strategy.upper()}",
+            (x1, max(20, y1 - 15)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            overlay,
+            f"Area: {int(area)}, Rect: {rectangularity:.2f}",
+            (x1, max(40, y1 - 35)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 0),
+            1,
+        )
+        debug_callback("open_field_final_selection", {
+            "image": overlay,
+            "mask": binary,
+            "chosen_strategy": best_strategy,
+            "strategies_tried": list(strategy_results.keys()),
+            "area": int(area),
+            "rectangularity": float(rectangularity),
+            "position_score": float(position_score),
+            "aspect_score": float(aspect_score),
+            "description": f"Final choice: {best_strategy} strategy with area {int(area)}",
+        })
+    
+    # Apply margins
     x2 = x1 + cw
     y2 = y1 + ch
     x1 = max(0, x1 - margin_px)
     y1 = max(0, y1 - margin_px)
     x2 = min(w, x2 + margin_px)
     y2 = min(h, y2 + margin_px)
+    
     if x2 <= x1 or y2 <= y1:
-        return (None, binary, None)
+        return (None, final_binary, None)
+    
     chosen_bbox = (int(x1), int(y1), int(x2), int(y2))
-    return ((int(x1), int(y1), int(x2), int(y2)), binary, chosen_bbox)
+    return ((int(x1), int(y1), int(x2), int(y2)), final_binary, chosen_bbox)
 
 
 def _detect_arena_elevated_plus(
@@ -483,28 +652,8 @@ def detect_arena_crop_xyxy(
             open_field_white_threshold,
             open_field_min_area_ratio,
             open_field_rectangularity_min,
+            debug_callback,
         )
-        if debug_callback is not None:
-            overlay = static_image_bgr.copy()
-            if chosen_bbox is not None:
-                x1, y1, x2, y2 = chosen_bbox
-                cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(
-                    overlay,
-                    "Arena crop (detected)",
-                    (x1, max(20, y1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 255, 0),
-                    2,
-                    cv2.LINE_AA,
-                )
-            debug_callback("open_field", {
-                "image": overlay,
-                "mask": mask,
-                "chosen_bbox": list(chosen_bbox) if chosen_bbox else None,
-                "description": "Open-field: white region mask; green box = chosen crop",
-            })
         return (box, None)
     
     # Elevated-plus path: edge detection + cross pattern analysis

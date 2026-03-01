@@ -178,7 +178,8 @@ def arena_crop_test(
     plus_maze_center_size_ratio: float | None = typer.Option(None, "--plus-maze-center-size-ratio", min=0.05, max=0.4, help="Elevated-plus only: expected center platform size as fraction of arm length. Overrides config."),
     plus_maze_aspect_tolerance: float | None = typer.Option(None, "--plus-maze-aspect-tolerance", min=0.1, max=0.8, help="Elevated-plus only: tolerance for arm length variations. Overrides config."),
     plus_maze_min_area_ratio: float | None = typer.Option(None, "--plus-maze-min-area-ratio", min=0.01, max=0.5, help="Elevated-plus only: minimum total maze area as fraction of frame. Overrides config."),
-    debug_out: Path | None = typer.Option(None, "--debug-out", file_okay=False, help="Write pipeline step images and manifest to this directory (what the pipeline sees at each step)"),
+    debug: bool = typer.Option(False, "--debug", help="Write debug pipeline images and manifest to the output directory"),
+    debug_out: Path | None = typer.Option(None, "--debug-out", file_okay=False, help="[DEPRECATED] Write pipeline step images and manifest to this directory (use --debug instead)"),
 ) -> None:
     """Test arena detection on a video or single image without running full tracking.
 
@@ -186,6 +187,9 @@ def arena_crop_test(
     arena_crop_static.png, arena_crop_edges.png, and arena_crop.json to --out so you can
     iterate on parameters quickly. Use --video + --frames to average frames, or --image
     to test on a single frame.
+    
+    Add --debug to generate detailed debug images showing the detection process including
+    cascading threshold strategies and candidate selection.
     """
     import cv2
 
@@ -339,24 +343,32 @@ def arena_crop_test(
         cv2.imwrite(str(out_dir / "arena_crop_edges_closed.png"), edges_closed_png)
 
     debug_manifest: list[dict] = []
+    
+    # Handle debug output - new --debug flag puts files in main output dir
+    debug_dir = None
+    if debug:
+        debug_dir = out_dir
+    elif debug_out is not None:
+        debug_dir = debug_out
+        typer.echo("Warning: --debug-out is deprecated, use --debug instead", err=True)
 
-    if debug_out is not None:
-        debug_out.mkdir(parents=True, exist_ok=True)
+    if debug_dir is not None:
+        debug_dir.mkdir(parents=True, exist_ok=True)
 
     def _arena_debug_callback(step: str, data: dict) -> None:
         img = data.get("image")
-        if img is not None and debug_out is not None:
+        if img is not None and debug_dir is not None:
             if img.ndim == 2:
                 img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
             out_img = resize_to_display_aspect(img, dar) if dar else img
-            path = debug_out / f"arena_debug_{step}.png"
+            path = debug_dir / f"arena_debug_{step}.png"
             cv2.imwrite(str(path), out_img)
-        if step == "open_field" and debug_out is not None:
+        if step == "open_field" and debug_dir is not None:
             mask = data.get("mask")
             if mask is not None and hasattr(mask, "ndim"):
                 mask_vis = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
                 mask_out = resize_to_display_aspect(mask_vis, dar) if dar else mask_vis
-                cv2.imwrite(str(debug_out / "arena_debug_open_field_mask.png"), mask_out)
+                cv2.imwrite(str(debug_dir / "arena_debug_open_field_mask.png"), mask_out)
         manifest_entry = {k: v for k, v in data.items() if k not in ("image", "mask")}
         manifest_entry["step"] = step
         debug_manifest.append(manifest_entry)
@@ -377,7 +389,7 @@ def arena_crop_test(
         circle_only=circle_only_val,
         circle_padding_ratio=circle_padding_ratio_val,
         force_square_crop=force_square_crop_val,
-        debug_callback=_arena_debug_callback if debug_out is not None else None,
+        debug_callback=_arena_debug_callback if debug_dir is not None else None,
         dar=dar,
         arena_type=arena_type_val,
         open_field_white_threshold=open_field_white_threshold_val,
@@ -393,11 +405,11 @@ def arena_crop_test(
         h, w = static_img.shape[:2]
         box = expand_arena_box_xyxy(box, w, h, crop_expand_ratio_val)
 
-    if debug_out is not None:
-        (debug_out / "arena_debug_manifest.json").write_text(
+    if debug_dir is not None:
+        (debug_dir / "arena_debug_manifest.json").write_text(
             json.dumps(debug_manifest, indent=2), encoding="utf-8"
         )
-        typer.echo(f"Debug pipeline output written to {debug_out}")
+        typer.echo(f"Debug pipeline output written to {debug_dir}")
 
     h, w = static_img.shape[:2]
     area_total = w * h
