@@ -15,6 +15,14 @@ from uuid import uuid4
 import cv2
 import numpy as np
 
+from scindra_engine.arena_crop import (
+    build_static_image,
+    crop_frame,
+    detect_arena_crop_xyxy,
+    expand_arena_box_xyxy,
+    get_arena_detection_edges,
+    get_arena_detection_edges_with_close,
+)
 from scindra_engine.detectors.base import Detector
 from scindra_engine.detectors.state import DetectorState, FrameDetectorInfo
 from scindra_engine.kalman_tracker import KalmanPointTracker
@@ -26,9 +34,13 @@ from scindra_engine.tracking import AdaptiveAreaFilter, TrackFrameDebug, TrackPo
 from scindra_engine.video_io import (
     FrameSampler,
     VideoReader,
+    crop_to_display_aspect,
+    draw_crop_box_for_display,
+    ensure_square_image,
     fix_video_display_aspect_ratio,
     get_video_display_aspect_ratio,
     require_ffmpeg_available,
+    resize_to_display_aspect,
 )
 from scindra_engine.visualize import write_heatmap_png, write_overlay_video as _write_overlay_video
 from scindra_engine.visualize.debug_blobs import render_debug_frame
@@ -175,6 +187,21 @@ def run_track_centroid(
         # Use actual decoded frame dimensions (handles rotation metadata mismatch)
         width, height = meta_reader.get_actual_dimensions()
 
+    # --- Arena crop: compute crop_xyxy and effective dimensions ---
+    crop_xyxy: tuple[int, int, int, int] | None = None
+    chosen_circle: tuple[int, int, int] | None = None  # (cx, cy, r) when crop came from Hough
+    eff_width = width
+    eff_height = height
+    arena_crop_config = getattr(config, "arena_crop", None)
+    if arena_crop_config is not None and arena_crop_config.enabled:
+        if arena_crop_config.mode == "MANUAL" and arena_crop_config.manual_crop_xyxy is not None:
+            crop_xyxy = arena_crop_config.manual_crop_xyxy
+            eff_width = crop_xyxy[2] - crop_xyxy[0]
+            eff_height = crop_xyxy[3] - crop_xyxy[1]
+        else:
+            # AUTO: will be computed in arena_crop_phase below (after progress is set up)
+            pass
+
     # --- Detector + debug configuration (does not require frames) ---
     detector_state: DetectorState | None = None
     if config.detector.enabled and detector is not None:
@@ -208,16 +235,114 @@ def run_track_centroid(
             n_sample = max(n_sample, 50)
         background_samples = min(n_sample, total_frames) if total_frames > 0 else n_sample
 
+    arena_crop_units = 0
+    if arena_crop_config is not None and arena_crop_config.enabled and arena_crop_config.mode == "AUTO":
+        arena_crop_units = min(arena_crop_config.n_frames_static, total_frames) if total_frames > 0 else arena_crop_config.n_frames_static
+
     detector_pre_units = total_frames if use_precompute_parallel and total_frames > 0 else 0
     tracking_units = total_frames if total_frames > 0 else 0
     overlay_units = total_frames if overlay_enabled and total_frames > 0 else 0
     heatmap_units = total_frames if heatmap_enabled and total_frames > 0 else 0
 
-    total_units = background_samples + detector_pre_units + tracking_units + overlay_units + heatmap_units
+    total_units = arena_crop_units + background_samples + detector_pre_units + tracking_units + overlay_units + heatmap_units
 
     global_progress: _GlobalProgress | None = None
     if progress_callback is not None and total_units > 0:
         global_progress = _GlobalProgress(total_units=total_units, callback=progress_callback)
+
+    # Arena crop AUTO phase: build static image and detect crop box
+    if arena_crop_units > 0 and arena_crop_config is not None:
+        arena_crop_phase = global_progress.start_phase(arena_crop_units) if global_progress is not None else None
+        with VideoReader(video_path) as crop_reader:
+            static_img = build_static_image(
+                crop_reader,
+                arena_crop_units,
+                method=arena_crop_config.static_method,
+                progress_callback=arena_crop_phase.callback if arena_crop_phase is not None else None,
+            )
+        # Save static image and edges so user can see what the pipeline is analyzing (resize to DAR to avoid distortion)
+        dar = get_video_display_aspect_ratio(video_path)
+        static_for_png = resize_to_display_aspect(static_img, dar)
+        cv2.imwrite(str(run_dir / "arena_crop_static.png"), static_for_png)
+        canny_low = getattr(arena_crop_config, "canny_low", 50)
+        canny_high = getattr(arena_crop_config, "canny_high", 150)
+        blur_ksize = getattr(arena_crop_config, "blur_ksize", 5)
+        edges = get_arena_detection_edges(static_img, canny_low=canny_low, canny_high=canny_high, blur_ksize=blur_ksize)
+        edges_for_png = resize_to_display_aspect(edges, dar)
+        cv2.imwrite(str(run_dir / "arena_crop_edges.png"), edges_for_png)
+        morph_close_ksize = getattr(arena_crop_config, "morph_close_ksize", 0)
+        if morph_close_ksize > 0:
+            edges_closed = get_arena_detection_edges_with_close(
+                static_img,
+                canny_low=canny_low,
+                canny_high=canny_high,
+                blur_ksize=blur_ksize,
+                morph_close_ksize=morph_close_ksize,
+            )
+            edges_closed_png = resize_to_display_aspect(edges_closed, dar)
+            cv2.imwrite(str(run_dir / "arena_crop_edges_closed.png"), edges_closed_png)
+        _debug_out = getattr(arena_crop_config, "debug_output_dir", None)
+        if _debug_out:
+            arena_debug_dir = Path(_debug_out).resolve()
+        elif debug_frames_dir is not None:
+            arena_debug_dir = run_dir / "arena_debug"
+        else:
+            arena_debug_dir = None
+        arena_debug_manifest: list[dict] = []
+
+        def _arena_debug_cb(step: str, data: dict) -> None:
+            img = data.get("image")
+            if img is not None and arena_debug_dir is not None:
+                if img.ndim == 2:
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+                out_img = resize_to_display_aspect(img, dar)
+                cv2.imwrite(str(arena_debug_dir / f"arena_debug_{step}.png"), out_img)
+            entry = {k: v for k, v in data.items() if k != "image"}
+            entry["step"] = step
+            arena_debug_manifest.append(entry)
+
+        if arena_debug_dir is not None:
+            arena_debug_dir.mkdir(parents=True, exist_ok=True)
+        box, chosen_circle = detect_arena_crop_xyxy(
+            static_img,
+            margin_px=arena_crop_config.margin_px,
+            min_area_ratio=arena_crop_config.min_area_ratio,
+            canny_low=canny_low,
+            canny_high=canny_high,
+            blur_ksize=blur_ksize,
+            morph_close_ksize=getattr(arena_crop_config, "morph_close_ksize", 0),
+            use_hough_circle=getattr(arena_crop_config, "use_hough_circle", True),
+            hough_min_radius_ratio=getattr(arena_crop_config, "hough_min_radius_ratio", 0.08),
+            hough_max_radius_ratio=getattr(arena_crop_config, "hough_max_radius_ratio", 0.48),
+            hough_center_margin_ratio=getattr(arena_crop_config, "hough_center_margin_ratio", 0.15),
+            hough_acc_threshold=getattr(arena_crop_config, "hough_acc_threshold", 25),
+            circle_only=getattr(arena_crop_config, "circle_only", False),
+            circle_padding_ratio=getattr(arena_crop_config, "circle_padding_ratio", 0.03),
+            force_square_crop=getattr(arena_crop_config, "force_square_crop", True),
+            debug_callback=_arena_debug_cb if arena_debug_dir is not None else None,
+            dar=dar,
+        )
+        if arena_debug_dir is not None:
+            (arena_debug_dir / "arena_debug_manifest.json").write_text(
+                json.dumps(arena_debug_manifest, indent=2), encoding="utf-8"
+            )
+        if box is not None:
+            expand_ratio = getattr(arena_crop_config, "crop_expand_ratio", 0.0)
+            if expand_ratio > 0:
+                h, w = static_img.shape[:2]
+                box = expand_arena_box_xyxy(box, w, h, expand_ratio)
+            crop_xyxy = box
+            eff_width = crop_xyxy[2] - crop_xyxy[0]
+            eff_height = crop_xyxy[3] - crop_xyxy[1]
+            if not getattr(arena_crop_config, "use_circle_mask", True):
+                chosen_circle = None
+            # Output: full frame with detected box (drawn in DAR space so box shape is correct), closed edges (if used), and cropped frame
+            box_for_png = draw_crop_box_for_display(static_img, crop_xyxy, dar)
+            cv2.imwrite(str(run_dir / "arena_crop_box.png"), box_for_png)
+            cropped = crop_to_display_aspect(static_img, crop_xyxy, dar)
+            if chosen_circle is not None and getattr(arena_crop_config, "force_square_crop", True):
+                cropped = ensure_square_image(cropped)
+            cv2.imwrite(str(run_dir / "arena_crop_cropped.png"), cropped)
 
     # Background model (may emit its own phase progress)
     background_phase: _PhaseProgress | None = None
@@ -228,11 +353,31 @@ def run_track_centroid(
         background = _build_background(
             reader,
             config,
+            crop_xyxy=crop_xyxy,
             progress_callback=background_phase.callback if background_phase is not None else None,
         )
 
-    # Build arena ROI mask once (at processing resolution)
-    arena_mask = _load_or_build_arena_mask(config, height, width)
+    # Write arena_crop.json so the user can see whether crop was applied and the box
+    _write_arena_crop_info(run_dir, crop_xyxy, eff_width, eff_height, arena_crop_config)
+
+    # When debug mode and crop applied, write a preview image (full frame 0 with crop box)
+    if debug_frames_dir is not None and crop_xyxy is not None:
+        _write_arena_crop_preview(video_path, crop_xyxy, debug_frames_dir, dar)
+
+    # Build arena ROI mask once (at processing resolution; use effective dimensions when cropped)
+    arena_mask = _load_or_build_arena_mask(config, eff_height, eff_width, crop_xyxy=crop_xyxy)
+    if chosen_circle is not None and crop_xyxy is not None:
+        circle_mask = _build_circle_arena_mask(
+            crop_xyxy,
+            chosen_circle,
+            eff_width,
+            eff_height,
+            config.downsample_factor,
+        )
+        if arena_mask is not None:
+            arena_mask = cv2.bitwise_and(arena_mask, circle_mask)
+        else:
+            arena_mask = circle_mask
 
     det_infos: list[FrameDetectorInfo] | None = None
 
@@ -252,6 +397,8 @@ def run_track_centroid(
     else:
         tracking_progress_cb = progress_callback
 
+    dar = get_video_display_aspect_ratio(video_path)
+
     if debug_frames_dir is not None or (detector_state is not None and not use_precompute_parallel):
         # Sequential: required for debug frames or (by default) detector-assisted mode
         with VideoReader(video_path) as reader:
@@ -261,10 +408,12 @@ def run_track_centroid(
                 background,
                 tracking_progress_cb,
                 arena_mask=arena_mask,
+                crop_xyxy=crop_xyxy,
                 debug_frames_dir=debug_frames_dir,
                 debug_frame_interval=getattr(config, "debug_frame_interval", 30),
                 debug_max_frames=getattr(config, "debug_max_frames", 100),
                 detector_state=detector_state,
+                display_aspect_ratio=dar,
             )
     else:
         # Parallel processing (classical-only, or detector with precomputed ROIs)
@@ -285,6 +434,7 @@ def run_track_centroid(
                 progress_callback=detector_phase.callback if detector_phase is not None else None,
                 batch_size=batch_size,
                 stride=stride,
+                crop_xyxy=crop_xyxy,
             )
 
         try:
@@ -297,6 +447,8 @@ def run_track_centroid(
                 chunk_size=effective_chunk_size,
                 arena_mask=arena_mask,
                 det_infos=det_infos,
+                crop_xyxy=crop_xyxy,
+                display_aspect_ratio=dar,
             )
         except Exception:
             # Fallback to sequential processing on error
@@ -307,7 +459,9 @@ def run_track_centroid(
                     background,
                     tracking_progress_cb,
                     arena_mask=arena_mask,
+                    crop_xyxy=crop_xyxy,
                     detector_state=detector_state,
+                    display_aspect_ratio=dar,
                 )
 
     # Post-processing: key-frame interpolation
@@ -325,6 +479,8 @@ def run_track_centroid(
     }
     if command is not None:
         run_meta["command"] = command
+    if crop_xyxy is not None:
+        run_meta["crop_xyxy"] = list(crop_xyxy)
     run_meta["config"] = config.model_dump(mode="json")
     summary_path = run_dir / "tracking_summary.json"
     summary_path.write_text(json.dumps(run_meta, indent=2), encoding="utf-8")
@@ -340,7 +496,7 @@ def run_track_centroid(
 
     # Run overlay and heatmap in parallel when both are enabled; otherwise run singly
     if overlay_enabled and heatmap_enabled:
-        if width <= 0 or height <= 0:
+        if eff_width <= 0 or eff_height <= 0:
             raise RuntimeError("Video dimensions are not available for heatmap output")
         require_ffmpeg_available()
         overlay_path = run_dir / "overlay.mp4"
@@ -355,15 +511,17 @@ def run_track_centroid(
                 str(overlay_path),
                 trail_length=effective_trail_length,
                 scale=overlay_scale,
+                crop_xyxy=crop_xyxy,
                 progress_callback=overlay_phase.callback if overlay_phase is not None else None,
             )
             future_heatmap = ex.submit(
                 write_heatmap_png,
-                width,
-                height,
+                eff_width,
+                eff_height,
                 points,
                 str(heatmap_path),
                 blur_ksize=heatmap_blur_ksize,
+                display_aspect_ratio=dar,
                 progress_callback=heatmap_phase.callback if heatmap_phase is not None else None,
             )
             future_overlay.result()
@@ -383,19 +541,21 @@ def run_track_centroid(
                 str(overlay_path),
                 trail_length=effective_trail_length,
                 scale=getattr(config, "overlay_scale", 0.25),
+                crop_xyxy=crop_xyxy,
                 progress_callback=overlay_phase.callback if overlay_phase is not None else None,
             )
             fix_video_display_aspect_ratio(overlay_path, video_path)
         if heatmap_enabled:
-            if width <= 0 or height <= 0:
+            if eff_width <= 0 or eff_height <= 0:
                 raise RuntimeError("Video dimensions are not available for heatmap output")
             heatmap_path = run_dir / "heatmap.png"
             write_heatmap_png(
-                width=width,
-                height=height,
+                width=eff_width,
+                height=eff_height,
                 track_points=points,
                 out_path=str(heatmap_path),
                 blur_ksize=getattr(config, "heatmap_blur_ksize", 51),
+                display_aspect_ratio=dar,
                 progress_callback=heatmap_phase.callback if heatmap_phase is not None else None,
             )
 
@@ -499,6 +659,7 @@ def _create_scaled_tracking_config(
 def _build_background(
     reader: VideoReader,
     config: TrackCentroidConfig,
+    crop_xyxy: tuple[int, int, int, int] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> BackgroundModel | None:
     if config.preprocessing.background_model == "none":
@@ -511,11 +672,15 @@ def _build_background(
         n_sample = max(n_sample, 50)
 
     frames = [frame for _, frame in sampler.sample(n_sample, progress_callback=progress_callback)]
-    
+
+    # Crop to arena box before downsampling when arena crop is enabled
+    if crop_xyxy is not None:
+        frames = [crop_frame(f, crop_xyxy) for f in frames]
+
     # Downsample frames if downsampling is enabled
     if config.downsample_factor is not None and config.downsample_factor > 1.0:
         frames = [_downsample_frame(frame, config.downsample_factor) for frame in frames]
-    
+
     return build_background(frames, config.preprocessing)
 
 
@@ -538,6 +703,7 @@ def _precompute_detector_infos(
     progress_callback: Callable[[int, int], None] | None = None,
     batch_size: int = 8,
     stride: int = 1,
+    crop_xyxy: tuple[int, int, int, int] | None = None,
 ) -> list[FrameDetectorInfo]:
     """Run the detector in a pre-pass to build a per-frame ROI schedule.
 
@@ -574,6 +740,8 @@ def _precompute_detector_infos(
     with VideoReader(video_path) as reader:
         total = reader.frame_count
         for idx, frame in reader.iter_frames():
+            if crop_xyxy is not None:
+                frame = crop_frame(frame, crop_xyxy)
             if detector_state.should_run(idx, 1.0, True) and (
                 stride <= 1 or idx % stride == 0
             ):
@@ -590,6 +758,8 @@ def _precompute_detector_infos(
     det_infos = []
     with VideoReader(video_path) as reader:
         for idx, frame in reader.iter_frames():
+            if crop_xyxy is not None:
+                frame = crop_frame(frame, crop_xyxy)
             frame_hw = frame.shape[:2]
             if idx in stored_infos:
                 det_infos.append(stored_infos[idx])
@@ -646,12 +816,48 @@ def _precompute_detector_infos(
     return det_infos
 
 
+def _build_circle_arena_mask(
+    crop_xyxy: tuple[int, int, int, int],
+    chosen_circle: tuple[int, int, int],
+    orig_width: int,
+    orig_height: int,
+    downsample_factor: float | None,
+) -> np.ndarray:
+    """Build a binary mask (255 inside circle) at processing resolution from detected Hough circle.
+
+    chosen_circle is (cx, cy, r) in full-frame coordinates; crop_xyxy is (x1, y1, x2, y2).
+    """
+    x1, y1, x2, y2 = crop_xyxy
+    cx, cy, r = chosen_circle
+    # Circle center and radius in cropped frame
+    cx_crop = cx - x1
+    cy_crop = cy - y1
+    if downsample_factor is not None and downsample_factor > 1.0:
+        proc_w = int(orig_width / downsample_factor)
+        proc_h = int(orig_height / downsample_factor)
+        cx_p = cx_crop / downsample_factor
+        cy_p = cy_crop / downsample_factor
+        r_p = r / downsample_factor
+    else:
+        proc_w = orig_width
+        proc_h = orig_height
+        cx_p, cy_p, r_p = float(cx_crop), float(cy_crop), float(r)
+    mask = np.zeros((proc_h, proc_w), dtype=np.uint8)
+    cv2.circle(mask, (int(round(cx_p)), int(round(cy_p))), int(round(r_p)), 255, -1)
+    return mask
+
+
 def _load_or_build_arena_mask(
     config: TrackCentroidConfig,
     orig_height: int,
     orig_width: int,
+    crop_xyxy: tuple[int, int, int, int] | None = None,
 ) -> np.ndarray | None:
     """Load or build the arena ROI mask at processing resolution.
+
+    orig_height/orig_width are the effective frame dimensions (cropped when
+    crop_xyxy is set). When crop_xyxy is set, geometric ROI params are
+    converted from full-frame to cropped coordinates.
 
     The returned mask is a single-channel ``uint8`` image where 255 marks
     pixels *inside* the arena.  It is sized to the processing resolution
@@ -672,29 +878,34 @@ def _load_or_build_arena_mask(
         proc_w = orig_width
         proc_h = orig_height
 
+    offset_x = crop_xyxy[0] if crop_xyxy is not None else 0
+    offset_y = crop_xyxy[1] if crop_xyxy is not None else 0
+
     # --- mask from image file ---
     if roi.mask_path is not None:
         raw = cv2.imread(roi.mask_path, cv2.IMREAD_GRAYSCALE)
         if raw is None:
             raise FileNotFoundError(f"Arena mask image not found: {roi.mask_path}")
+        if crop_xyxy is not None:
+            raw = raw[crop_xyxy[1]:crop_xyxy[3], crop_xyxy[0]:crop_xyxy[2]]
         if raw.shape[:2] != (proc_h, proc_w):
             raw = cv2.resize(raw, (proc_w, proc_h), interpolation=cv2.INTER_NEAREST)
         _, mask = cv2.threshold(raw, 127, 255, cv2.THRESH_BINARY)
         return mask
 
-    # --- geometric shape ---
+    # --- geometric shape (params in full-frame coords; convert to cropped when applicable) ---
     if roi.kind is not None and roi.params is not None:
         mask = np.zeros((proc_h, proc_w), dtype=np.uint8)
         p = roi.params
 
         if roi.kind == "CIRCLE":
-            cx, cy, r = p["center_x"], p["center_y"], p["radius"]
+            cx, cy, r = p["center_x"] - offset_x, p["center_y"] - offset_y, p["radius"]
             if factor is not None:
                 cx, cy, r = cx / factor, cy / factor, r / factor
             cv2.circle(mask, (int(round(cx)), int(round(cy))), int(round(r)), 255, -1)
 
         elif roi.kind == "RECT":
-            x, y, w, h = p["x"], p["y"], p["w"], p["h"]
+            x, y, w, h = p["x"] - offset_x, p["y"] - offset_y, p["w"], p["h"]
             if factor is not None:
                 x, y, w, h = x / factor, y / factor, w / factor, h / factor
             x, y, w, h = int(round(x)), int(round(y)), int(round(w)), int(round(h))
@@ -713,10 +924,12 @@ def _track_video(
     progress_callback: Callable[[int, int], None] | None,
     arena_mask: np.ndarray | None = None,
     *,
+    crop_xyxy: tuple[int, int, int, int] | None = None,
     debug_frames_dir: Path | None = None,
     debug_frame_interval: int = 30,
     debug_max_frames: int | None = 100,
     detector_state: DetectorState | None = None,
+    display_aspect_ratio: str | None = None,
 ) -> tuple[list[TrackPoint], list[FrameDetectorInfo] | None]:
     points: list[TrackPoint] = []
     det_infos: list[FrameDetectorInfo] | None = [] if detector_state is not None else None
@@ -773,6 +986,9 @@ def _track_video(
         tracking_started = True  # no deferral when detector is off or option disabled
 
     for idx, frame in reader.iter_frames():
+        # Crop to arena box first (before detector and pipeline)
+        if crop_xyxy is not None:
+            frame = crop_frame(frame, crop_xyxy)
         # --- Detector-assisted ROI (runs on full-res frame BEFORE downsampling) ---
         det_info: FrameDetectorInfo | None = None
         roi_xyxy: tuple[int, int, int, int] | None = None
@@ -969,6 +1185,21 @@ def _track_video(
                     frame, debug_mask, debug_sink[-1],
                     roi_offset_x=off_x, roi_offset_y=off_y,
                 )
+                if crop_xyxy is not None:
+                    cw = crop_xyxy[2] - crop_xyxy[0]
+                    ch = crop_xyxy[3] - crop_xyxy[1]
+                    cv2.putText(
+                        debug_img,
+                        f"Arena crop: {cw}x{ch}",
+                        (8, debug_img.shape[0] - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 255, 0),
+                        1,
+                        cv2.LINE_AA,
+                    )
+                if display_aspect_ratio:
+                    debug_img = resize_to_display_aspect(debug_img, display_aspect_ratio)
                 out_path = debug_frames_dir / f"frame_{idx:06d}.png"
                 if cv2.imwrite(str(out_path), debug_img):
                     debug_frames_written += 1
@@ -1180,6 +1411,7 @@ def _process_chunk(
     arena_mask: np.ndarray | None = None,
     det_infos: list[FrameDetectorInfo] | None = None,
     first_detection_frame: int | None = None,
+    crop_xyxy: tuple[int, int, int, int] | None = None,
 ) -> list[TrackPoint]:
     """Process a chunk of frames from a video.
 
@@ -1254,6 +1486,8 @@ def _process_chunk(
     with VideoReader(video_path) as reader:
         frame_count = 0
         for idx, frame in reader.iter_frames(start_frame=chunk_start, end_frame=chunk_end):
+            if crop_xyxy is not None:
+                frame = crop_frame(frame, crop_xyxy)
             # Optional detector ROI (full-resolution coords from pre-pass)
             roi_xyxy: tuple[int, int, int, int] | None = None
             di: FrameDetectorInfo | None = None
@@ -1730,6 +1964,8 @@ def _track_video_parallel(
     chunk_size: int = 200,
     arena_mask: np.ndarray | None = None,
     det_infos: list[FrameDetectorInfo] | None = None,
+    crop_xyxy: tuple[int, int, int, int] | None = None,
+    display_aspect_ratio: str | None = None,
 ) -> list[TrackPoint]:
     """Track video frames using parallel chunk processing.
 
@@ -1755,13 +1991,13 @@ def _track_video_parallel(
     # MOG2 background is stateful — force sequential processing
     if background is not None and background.mog2_subtractor is not None:
         with VideoReader(video_path) as reader:
-            pts, _ = _track_video(reader, config, background, progress_callback, arena_mask=arena_mask)
+            pts, _ = _track_video(reader, config, background, progress_callback, arena_mask=arena_mask, crop_xyxy=crop_xyxy, display_aspect_ratio=display_aspect_ratio)
             return pts
 
     # Use sequential processing for small videos
     if total_frames <= chunk_size:
         with VideoReader(video_path) as reader:
-            pts, _ = _track_video(reader, config, background, progress_callback, arena_mask=arena_mask)
+            pts, _ = _track_video(reader, config, background, progress_callback, arena_mask=arena_mask, crop_xyxy=crop_xyxy, display_aspect_ratio=display_aspect_ratio)
             return pts
 
     # Determine number of workers
@@ -1841,6 +2077,7 @@ def _track_video_parallel(
                     arena_mask=arena_mask,
                     det_infos=det_infos,
                     first_detection_frame=first_detection_frame,
+                    crop_xyxy=crop_xyxy,
                 )
                 future_to_chunk[future] = chunk_idx
 
@@ -1858,7 +2095,7 @@ def _track_video_parallel(
                     if progress_callback:
                         progress_callback(0, total_frames)
                     with VideoReader(video_path) as reader:
-                        pts, _ = _track_video(reader, config, background, progress_callback, arena_mask=arena_mask)
+                        pts, _ = _track_video(reader, config, background, progress_callback, arena_mask=arena_mask, crop_xyxy=crop_xyxy, display_aspect_ratio=display_aspect_ratio)
                         return pts
 
             # Merge chunks in order
@@ -1879,6 +2116,89 @@ def _track_video_parallel(
         progress_callback(total_frames, total_frames)
 
     return all_points
+
+
+def _write_arena_crop_info(
+    run_dir: Path,
+    crop_xyxy: tuple[int, int, int, int] | None,
+    eff_width: int,
+    eff_height: int,
+    arena_crop_config: object | None,
+) -> None:
+    """Write arena_crop.json so the user can see whether crop was applied, the box, and CV params."""
+    if arena_crop_config is None:
+        return
+    path = run_dir / "arena_crop.json"
+    area_total = eff_width * eff_height
+    min_area_ratio = getattr(arena_crop_config, "min_area_ratio", 0.05)
+    min_area_px = max(100, int(area_total * min_area_ratio))
+    params = {
+        "canny_low": getattr(arena_crop_config, "canny_low", 50),
+        "canny_high": getattr(arena_crop_config, "canny_high", 150),
+        "blur_ksize": getattr(arena_crop_config, "blur_ksize", 5),
+        "morph_close_ksize": getattr(arena_crop_config, "morph_close_ksize", 0),
+        "use_hough_circle": getattr(arena_crop_config, "use_hough_circle", True),
+        "hough_min_radius_ratio": getattr(arena_crop_config, "hough_min_radius_ratio", 0.08),
+        "hough_max_radius_ratio": getattr(arena_crop_config, "hough_max_radius_ratio", 0.48),
+        "hough_center_margin_ratio": getattr(arena_crop_config, "hough_center_margin_ratio", 0.15),
+        "min_area_ratio": min_area_ratio,
+        "min_area_px": min_area_px,
+        "margin_px": getattr(arena_crop_config, "margin_px", 0),
+    }
+    if crop_xyxy is not None:
+        data = {
+            "applied": True,
+            "crop_xyxy": list(crop_xyxy),
+            "width": eff_width,
+            "height": eff_height,
+            "params": params,
+            "static_image": "arena_crop_static.png",
+            "edges_image": "arena_crop_edges.png",
+            "box_image": "arena_crop_box.png",
+            "cropped_image": "arena_crop_cropped.png",
+        }
+        if getattr(arena_crop_config, "morph_close_ksize", 0) > 0:
+            data["edges_closed_image"] = "arena_crop_edges_closed.png"
+    else:
+        data = {
+            "applied": False,
+            "reason": "no_contour",
+            "params": params,
+            "static_image": "arena_crop_static.png",
+            "edges_image": "arena_crop_edges.png",
+        }
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _write_arena_crop_preview(
+    video_path: Path,
+    crop_xyxy: tuple[int, int, int, int],
+    debug_frames_dir: Path,
+    dar: str | None = None,
+) -> None:
+    """Write arena_crop_preview.png: full first frame with crop rectangle (debug only)."""
+    with VideoReader(video_path) as reader:
+        for idx, frame in reader.iter_frames():
+            if idx > 0:
+                break
+            out = frame.copy()
+            x1, y1, x2, y2 = crop_xyxy
+            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(
+                out,
+                "Arena crop (green)",
+                (x1, max(20, y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+            if dar:
+                out = resize_to_display_aspect(out, dar)
+            preview_path = debug_frames_dir / "arena_crop_preview.png"
+            cv2.imwrite(str(preview_path), out)
+            break
 
 
 def _write_per_frame(
@@ -1968,35 +2288,6 @@ def _jump_rate(
     return (jumps / total) if total > 0 else 0.0
 
 
-def _resize_frame_to_display_aspect(
-    frame: np.ndarray,
-    dar: str,
-) -> np.ndarray:
-    """Resize frame so that width/height matches display aspect ratio (e.g. '16:9')."""
-    try:
-        parts = dar.strip().split(":")
-        if len(parts) != 2:
-            return frame
-        w_ratio = float(parts[0])
-        h_ratio = float(parts[1])
-    except (ValueError, AttributeError):
-        return frame
-    if w_ratio <= 0 or h_ratio <= 0:
-        return frame
-    target_ratio = w_ratio / h_ratio
-    h, w = frame.shape[:2]
-    current_ratio = w / h
-    if abs(current_ratio - target_ratio) < 0.01:
-        return frame
-    if current_ratio > target_ratio:
-        new_w = int(round(h * target_ratio))
-        new_size = (new_w, h)
-    else:
-        new_h = int(round(w / target_ratio))
-        new_size = (w, new_h)
-    return cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
-
-
 def _write_detector_debug_frames(
     video_path: Path,
     det_infos: list[FrameDetectorInfo],
@@ -2055,9 +2346,8 @@ def _write_detector_debug_frames(
                     (10, y_text), font, font_scale * 0.8, (128, 128, 128), thickness, cv2.LINE_AA,
                 )
 
-            # Resize to display aspect ratio so PNG doesn't look squashed
             if dar:
-                frame = _resize_frame_to_display_aspect(frame, dar)
+                frame = resize_to_display_aspect(frame, dar)
             cv2.imwrite(str(out_dir / f"det_frame_{idx:06d}.png"), frame)
 
 

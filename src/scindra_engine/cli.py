@@ -151,6 +151,242 @@ def extract_frames(
         raise typer.Exit(code=1)
 
 
+@app.command("arena-crop-test")
+def arena_crop_test(
+    out_dir: Path = typer.Option(..., "--out", file_okay=False, help="Directory to write static image, edges, and result JSON"),
+    video: Path | None = typer.Option(None, "--video", exists=True, file_okay=True, dir_okay=False, readable=True, help="Build static image from this video (sample N frames)"),
+    image: Path | None = typer.Option(None, "--image", exists=True, file_okay=True, dir_okay=False, readable=True, help="Use this single image as the static image (no averaging)"),
+    frames: int = typer.Option(50, "--frames", min=5, help="When using --video, number of frames to sample for the static image"),
+    config_path: Path | None = typer.Option(None, "--config", exists=True, file_okay=True, dir_okay=False, readable=True, help="Optional JSON/YAML config; arena_crop params will be used"),
+    min_area_ratio: float | None = typer.Option(None, "--min-area-ratio", min=0.0, max=1.0, help="Override min contour area as fraction of frame (e.g. 0.02)"),
+    canny_low: int | None = typer.Option(None, "--canny-low", min=0, max=255, help="Override Canny low threshold"),
+    canny_high: int | None = typer.Option(None, "--canny-high", min=0, max=255, help="Override Canny high threshold"),
+    blur_ksize: int | None = typer.Option(None, "--blur-ksize", min=1, max=31, help="Override Gaussian blur kernel size (odd)"),
+    margin_px: int | None = typer.Option(None, "--margin-px", help="Override margin pixels (negative = shrink box)"),
+    morph_close_ksize: int | None = typer.Option(None, "--morph-close-ksize", min=0, max=31, help="Close edges to connect gaps (0=off, try 9-15 for broken circles)"),
+    crop_expand_ratio: float | None = typer.Option(None, "--crop-expand-ratio", min=0.0, max=0.5, help="Expand detected box by this fraction so outer arena edge is included (e.g. 0.05)"),
+    use_hough_circle: bool = typer.Option(True, "--hough/--no-hough", help="Try Hough circle detection first for circular arenas"),
+    hough_min_radius_ratio: float | None = typer.Option(None, "--hough-min-radius", min=0.01, max=0.5, help="Hough min radius as fraction of min(w,h)"),
+    hough_max_radius_ratio: float | None = typer.Option(None, "--hough-max-radius", min=0.1, max=0.99, help="Hough max radius as fraction of min(w,h)"),
+    hough_acc_threshold: int | None = typer.Option(None, "--hough-acc-threshold", min=5, max=100, help="Hough accumulator threshold; lower = more sensitive"),
+    circle_only: bool = typer.Option(False, "--circle-only/--contour-fallback", help="Only use circle detection; no contour fallback"),
+    debug_out: Path | None = typer.Option(None, "--debug-out", file_okay=False, help="Write pipeline step images and manifest to this directory (what the pipeline sees at each step)"),
+) -> None:
+    """Test arena detection on a video or single image without running full tracking.
+
+    Builds (or loads) a static image, runs the contour-based arena detector, and writes
+    arena_crop_static.png, arena_crop_edges.png, and arena_crop.json to --out so you can
+    iterate on parameters quickly. Use --video + --frames to average frames, or --image
+    to test on a single frame.
+    """
+    import cv2
+
+    from scindra_engine.arena_crop import (
+        build_static_image,
+        detect_arena_crop_xyxy,
+        expand_arena_box_xyxy,
+        get_arena_detection_edges,
+        get_arena_detection_edges_with_close,
+    )
+    from scindra_engine.video_io import crop_to_display_aspect, draw_crop_box_for_display, ensure_square_image, get_video_display_aspect_ratio, resize_to_display_aspect
+
+    if video is None and image is None:
+        typer.echo("Error: provide either --video or --image.", err=True)
+        raise typer.Exit(code=1)
+    if video is not None and image is not None:
+        typer.echo("Error: provide only one of --video or --image.", err=True)
+        raise typer.Exit(code=1)
+
+    out_dir = out_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Resolve params from config or defaults
+    canny_low_val = 50
+    canny_high_val = 150
+    blur_ksize_val = 5
+    min_area_ratio_val = 0.05
+    margin_px_val = 0
+    crop_expand_ratio_val = 0.0
+    circle_padding_ratio_val = 0.03
+    force_square_crop_val = True
+    morph_close_ksize_val = 0
+    use_hough_circle_val = True
+    hough_min_radius_val = 0.08
+    hough_max_radius_val = 0.48
+    hough_center_margin_val = 0.15
+    hough_acc_threshold_val = 25
+    circle_only_val = False
+    if config_path is not None:
+        data = _load_config(config_path)
+        try:
+            cfg = TrackCentroidConfig.model_validate(data)
+            ac = cfg.arena_crop
+            canny_low_val = ac.canny_low
+            canny_high_val = ac.canny_high
+            blur_ksize_val = ac.blur_ksize
+            min_area_ratio_val = ac.min_area_ratio
+            margin_px_val = ac.margin_px
+            crop_expand_ratio_val = getattr(ac, "crop_expand_ratio", 0.0)
+            circle_padding_ratio_val = getattr(ac, "circle_padding_ratio", 0.03)
+            force_square_crop_val = getattr(ac, "force_square_crop", True)
+            morph_close_ksize_val = getattr(ac, "morph_close_ksize", 0)
+            use_hough_circle_val = getattr(ac, "use_hough_circle", True)
+            hough_min_radius_val = getattr(ac, "hough_min_radius_ratio", 0.08)
+            hough_max_radius_val = getattr(ac, "hough_max_radius_ratio", 0.48)
+            hough_center_margin_val = getattr(ac, "hough_center_margin_ratio", 0.15)
+            hough_acc_threshold_val = getattr(ac, "hough_acc_threshold", 25)
+            circle_only_val = getattr(ac, "circle_only", False)
+        except Exception as e:
+            typer.echo(f"Warning: could not load arena_crop from config: {e}", err=True)
+    if canny_low is not None:
+        canny_low_val = canny_low
+    if canny_high is not None:
+        canny_high_val = canny_high
+    if blur_ksize is not None:
+        blur_ksize_val = blur_ksize
+    if min_area_ratio is not None:
+        min_area_ratio_val = min_area_ratio
+    if margin_px is not None:
+        margin_px_val = margin_px
+    if crop_expand_ratio is not None:
+        crop_expand_ratio_val = crop_expand_ratio
+    if morph_close_ksize is not None:
+        morph_close_ksize_val = morph_close_ksize
+    if not use_hough_circle:
+        use_hough_circle_val = False
+    if hough_min_radius_ratio is not None:
+        hough_min_radius_val = hough_min_radius_ratio
+    if hough_max_radius_ratio is not None:
+        hough_max_radius_val = hough_max_radius_ratio
+    if hough_acc_threshold is not None:
+        hough_acc_threshold_val = hough_acc_threshold
+    if circle_only:
+        circle_only_val = True
+
+    dar: str | None = None
+    if video is not None:
+        with VideoReader(video) as reader:
+            static_img = build_static_image(reader, min(frames, reader.frame_count), method="median")
+        dar = get_video_display_aspect_ratio(video)
+    else:
+        static_img = cv2.imread(str(image))
+        if static_img is None:
+            typer.echo(f"Error: could not load image '{image}'", err=True)
+            raise typer.Exit(code=1)
+
+    static_for_png = resize_to_display_aspect(static_img, dar) if dar else static_img
+    cv2.imwrite(str(out_dir / "arena_crop_static.png"), static_for_png)
+    edges = get_arena_detection_edges(
+        static_img, canny_low=canny_low_val, canny_high=canny_high_val, blur_ksize=blur_ksize_val
+    )
+    edges_for_png = resize_to_display_aspect(edges, dar) if dar else edges
+    cv2.imwrite(str(out_dir / "arena_crop_edges.png"), edges_for_png)
+    if morph_close_ksize_val > 0:
+        edges_closed = get_arena_detection_edges_with_close(
+            static_img,
+            canny_low=canny_low_val,
+            canny_high=canny_high_val,
+            blur_ksize=blur_ksize_val,
+            morph_close_ksize=morph_close_ksize_val,
+        )
+        edges_closed_png = resize_to_display_aspect(edges_closed, dar) if dar else edges_closed
+        cv2.imwrite(str(out_dir / "arena_crop_edges_closed.png"), edges_closed_png)
+
+    debug_manifest: list[dict] = []
+
+    if debug_out is not None:
+        debug_out.mkdir(parents=True, exist_ok=True)
+
+    def _arena_debug_callback(step: str, data: dict) -> None:
+        img = data.get("image")
+        if img is not None and debug_out is not None:
+            if img.ndim == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            out_img = resize_to_display_aspect(img, dar) if dar else img
+            path = debug_out / f"arena_debug_{step}.png"
+            cv2.imwrite(str(path), out_img)
+        manifest_entry = {k: v for k, v in data.items() if k != "image"}
+        manifest_entry["step"] = step
+        debug_manifest.append(manifest_entry)
+
+    box, _chosen_circle = detect_arena_crop_xyxy(
+        static_img,
+        margin_px=margin_px_val,
+        min_area_ratio=min_area_ratio_val,
+        canny_low=canny_low_val,
+        canny_high=canny_high_val,
+        blur_ksize=blur_ksize_val,
+        morph_close_ksize=morph_close_ksize_val,
+        use_hough_circle=use_hough_circle_val,
+        hough_min_radius_ratio=hough_min_radius_val,
+        hough_max_radius_ratio=hough_max_radius_val,
+        hough_center_margin_ratio=hough_center_margin_val,
+        hough_acc_threshold=hough_acc_threshold_val,
+        circle_only=circle_only_val,
+        circle_padding_ratio=circle_padding_ratio_val,
+        force_square_crop=force_square_crop_val,
+        debug_callback=_arena_debug_callback if debug_out is not None else None,
+        dar=dar,
+    )
+    if box is not None and crop_expand_ratio_val > 0:
+        h, w = static_img.shape[:2]
+        box = expand_arena_box_xyxy(box, w, h, crop_expand_ratio_val)
+
+    if debug_out is not None:
+        (debug_out / "arena_debug_manifest.json").write_text(
+            json.dumps(debug_manifest, indent=2), encoding="utf-8"
+        )
+        typer.echo(f"Debug pipeline output written to {debug_out}")
+
+    h, w = static_img.shape[:2]
+    area_total = w * h
+    min_area_px = max(100, int(area_total * min_area_ratio_val))
+    result = {
+        "applied": box is not None,
+        "params": {
+            "canny_low": canny_low_val,
+            "canny_high": canny_high_val,
+            "blur_ksize": blur_ksize_val,
+            "morph_close_ksize": morph_close_ksize_val,
+            "use_hough_circle": use_hough_circle_val,
+            "hough_min_radius_ratio": hough_min_radius_val,
+            "hough_max_radius_ratio": hough_max_radius_val,
+            "hough_center_margin_ratio": hough_center_margin_val,
+            "min_area_ratio": min_area_ratio_val,
+            "min_area_px": min_area_px,
+            "margin_px": margin_px_val,
+        },
+        "static_image": "arena_crop_static.png",
+        "edges_image": "arena_crop_edges.png",
+    }
+    if morph_close_ksize_val > 0:
+        result["edges_closed_image"] = "arena_crop_edges_closed.png"
+    if box is not None:
+        result["crop_xyxy"] = list(box)
+        result["width"] = box[2] - box[0]
+        result["height"] = box[3] - box[1]
+        box_for_png = draw_crop_box_for_display(static_img, box, dar)
+        cv2.imwrite(str(out_dir / "arena_crop_box.png"), box_for_png)
+        cropped = crop_to_display_aspect(static_img, box, dar)
+        if _chosen_circle is not None and force_square_crop_val:
+            cropped = ensure_square_image(cropped)
+        cv2.imwrite(str(out_dir / "arena_crop_cropped.png"), cropped)
+        result["box_image"] = "arena_crop_box.png"
+        result["cropped_image"] = "arena_crop_cropped.png"
+        typer.echo(f"Detected arena crop: {box[2] - box[0]}x{box[3] - box[1]} at {box}")
+    else:
+        result["reason"] = "no_contour"
+        typer.echo("No arena contour met the criteria. Try lowering --min-area-ratio or adjusting --canny-low/--canny-high.")
+
+    (out_dir / "arena_crop.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    files_written = ["arena_crop_static.png", "arena_crop_edges.png", "arena_crop.json"]
+    if morph_close_ksize_val > 0:
+        files_written.append("arena_crop_edges_closed.png")
+    if box is not None:
+        files_written.extend(["arena_crop_box.png", "arena_crop_cropped.png"])
+    typer.echo("Wrote " + ", ".join(str(out_dir / f) for f in files_written))
+
+
 def _format_duration(seconds: float) -> str:
     """Format duration in seconds to a human-readable string.
     
@@ -339,6 +575,15 @@ def track_centroid(
         min=1,
         help="Gaussian blur kernel size for heatmap (must be odd). When omitted, use config default.",
     ),
+    arena_crop: str = typer.Option(
+        "off",
+        "--arena-crop",
+        help="Crop video to arena: auto (detect from static frame), manual (use --crop-xyxy), or off.",
+    ),
+    crop_x1: int | None = typer.Option(None, "--crop-x1", min=0, help="Arena crop left (manual mode)."),
+    crop_y1: int | None = typer.Option(None, "--crop-y1", min=0, help="Arena crop top (manual mode)."),
+    crop_x2: int | None = typer.Option(None, "--crop-x2", min=0, help="Arena crop right (manual mode)."),
+    crop_y2: int | None = typer.Option(None, "--crop-y2", min=0, help="Arena crop bottom (manual mode)."),
 ) -> None:
     """Track a centroid using the classical backend."""
     try:
@@ -351,6 +596,19 @@ def track_centroid(
         overrides: dict[str, object] = {}
         if downsample_factor is not None:
             overrides["downsample_factor"] = downsample_factor
+        # Arena crop: auto | manual | off
+        ac_val = (arena_crop or "off").strip().lower()
+        if ac_val in ("auto", "manual"):
+            ac_overrides: dict[str, object] = {"enabled": True, "mode": ac_val.upper()}
+            if ac_val == "manual":
+                if crop_x1 is None or crop_y1 is None or crop_x2 is None or crop_y2 is None:
+                    typer.echo("Error: --arena-crop manual requires --crop-x1, --crop-y1, --crop-x2, --crop-y2.", err=True)
+                    raise typer.Exit(1)
+                ac_overrides["manual_crop_xyxy"] = (crop_x1, crop_y1, crop_x2, crop_y2)
+            overrides["arena_crop"] = config.arena_crop.model_copy(update=ac_overrides)
+        elif ac_val != "off":
+            typer.echo(f"Error: --arena-crop must be auto, manual, or off (got {arena_crop!r}).", err=True)
+            raise typer.Exit(1)
         if debug:
             overrides["debug_mode"] = True
         if debug_interval is not None:

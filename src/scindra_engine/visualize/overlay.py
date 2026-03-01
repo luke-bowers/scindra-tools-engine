@@ -21,19 +21,21 @@ def write_overlay_video(
     trail_length: int = 30,
     progress_every_n: int = 30,
     scale: float = 1.0,
+    crop_xyxy: tuple[int, int, int, int] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> None:
     """Write an overlay video with centroid markers and optional trail.
 
     Args:
         video_path: Path to the source video.
-        track_points: List of TrackPoint objects for the video.
+        track_points: List of TrackPoint objects (coordinates in cropped space when crop_xyxy is set).
         out_path: Path to the output MP4 file.
         draw_radius: Circle radius in pixels for the centroid marker.
         draw_thickness: Thickness passed to cv2.circle (-1 for filled).
         draw_trail: Whether to draw a short trail of recent centroids.
         trail_length: Number of recent centroids to keep in the trail.
         progress_every_n: Emit a PROGRESS line every N frames.
+        crop_xyxy: When set, crop each frame to (x1, y1, x2, y2) and write at cropped size.
     """
     if trail_length <= 0:
         trail_length = 1
@@ -53,7 +55,15 @@ def write_overlay_video(
         fps = reader.fps
         total_frames = reader.frame_count
         # Use actual decoded frame dimensions (handles rotation metadata mismatch)
-        width, height = reader.get_actual_dimensions()
+        full_width, full_height = reader.get_actual_dimensions()
+
+        if crop_xyxy is not None:
+            x1, y1, x2, y2 = crop_xyxy
+            width = x2 - x1
+            height = y2 - y1
+        else:
+            width = full_width
+            height = full_height
 
         if width <= 0 or height <= 0:
             raise RuntimeError(f"Invalid video dimensions for overlay: {width}x{height}")
@@ -74,6 +84,9 @@ def write_overlay_video(
 
         try:
             for frame_idx, frame_bgr in reader.iter_frames():
+                if crop_xyxy is not None:
+                    x1, y1, x2, y2 = crop_xyxy
+                    frame_bgr = frame_bgr[y1:y2, x1:x2]
                 # Resize frame to output resolution first so drawing uses correct coordinate space
                 if frame_bgr.shape[1] != out_width or frame_bgr.shape[0] != out_height:
                     frame_bgr = cv2.resize(frame_bgr, (out_width, out_height), interpolation=cv2.INTER_AREA)

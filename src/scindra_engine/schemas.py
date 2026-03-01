@@ -130,6 +130,121 @@ class ArenaROIConfig(BaseModel):
         return self
 
 
+class ArenaCropConfig(BaseModel):
+    """Auto-detect or manually set a crop box so the arena fills the frame.
+
+    When enabled, frames are cropped to (x1, y1, x2, y2) before background
+    building and tracking. All outputs (overlay, heatmap, CSV) use cropped
+    coordinates so the maze sits at the frame extremities.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="When True, crop video to the arena bounding box.",
+    )
+    mode: Literal["AUTO", "MANUAL"] = Field(
+        default="AUTO",
+        description="AUTO: detect arena from static (median) frame. MANUAL: use crop_xyxy.",
+    )
+    n_frames_static: int = Field(
+        default=50,
+        ge=5,
+        description="Number of frames to sample for static image (AUTO mode).",
+    )
+    static_method: Literal["median", "mean"] = Field(
+        default="median",
+        description="How to combine frames into static image.",
+    )
+    detection_method: Literal["contour"] = Field(
+        default="contour",
+        description="Arena detection method (classical contour-based).",
+    )
+    margin_px: int = Field(
+        default=0,
+        description="Pixels to add to each side of detected box (negative = shrink).",
+    )
+    crop_expand_ratio: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=0.5,
+        description="Expand detected box by this fraction of its width/height so the outer edge of the arena is included (e.g. 0.05 = 5%% larger on each side).",
+    )
+    circle_padding_ratio: float = Field(
+        default=0.03,
+        ge=0.0,
+        le=0.2,
+        description="When a Hough circle is used, add this fraction of the radius to each side of the crop box (e.g. 0.03 = 3%% of radius). Makes the box a little wider around the circle.",
+    )
+    canny_low: int = Field(
+        default=50,
+        ge=0,
+        le=255,
+        description="Canny edge detector low threshold. Lower (e.g. 35–45) picks up more weak edges and can help close gaps in the rim.",
+    )
+    canny_high: int = Field(default=150, ge=0, le=255, description="Canny edge detector high threshold.")
+    blur_ksize: int = Field(default=5, ge=1, le=31, description="Gaussian blur kernel size (odd).")
+    morph_close_ksize: int = Field(
+        default=0,
+        ge=0,
+        le=31,
+        description="Morphological close kernel size on edges to connect gaps (0 = disabled). Increase to bridge larger gaps: try 15–21 if the outer rim is still disconnected.",
+    )
+    use_hough_circle: bool = Field(
+        default=True,
+        description="Try Hough circle detection first (works for circular arenas with broken edges).",
+    )
+    hough_min_radius_ratio: float = Field(
+        default=0.08,
+        ge=0.01,
+        le=0.5,
+        description="Min arena radius as fraction of min(width, height) for Hough.",
+    )
+    hough_max_radius_ratio: float = Field(
+        default=0.48,
+        ge=0.1,
+        le=0.99,
+        description="Max arena radius as fraction of min(width, height) for Hough.",
+    )
+    hough_center_margin_ratio: float = Field(
+        default=0.15,
+        ge=0.0,
+        le=0.4,
+        description="Arena center must be inside frame margin (fraction); rejects circles too near the edge.",
+    )
+    hough_acc_threshold: int = Field(
+        default=25,
+        ge=5,
+        le=100,
+        description="Hough circle accumulator threshold; lower = more sensitive (more circles found).",
+    )
+    circle_only: bool = Field(
+        default=False,
+        description="When True, only use circle detection; never fall back to contour (return no crop if no circle).",
+    )
+    min_area_ratio: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=1.0,
+        description="Minimum contour area as fraction of frame area to consider as arena.",
+    )
+    manual_crop_xyxy: tuple[int, int, int, int] | None = Field(
+        default=None,
+        description="Manual crop (x1, y1, x2, y2) in original video coords (MANUAL mode).",
+    )
+    debug_output_dir: str | None = Field(
+        default=None,
+        description="When set, write arena pipeline debug images (edges, hough, contour) to this directory. Path is relative to cwd. Use e.g. 'out/debug_arena' to always get debug in a fixed folder.",
+    )
+    use_circle_mask: bool = Field(
+        default=True,
+        description="When True and a Hough circle was used for the crop, apply a circular arena mask so tracking only uses the circle (ignores corners of the rectangular crop).",
+    )
+    force_square_crop: bool = Field(
+        default=True,
+        description="When True and a Hough circle was used, force the crop box to be square (same width and height). If the circle is near a frame edge, the square may be smaller so it stays in frame.",
+    )
+
+
 class ZonesConfig(BaseModel):
     enabled: bool = True
     mode: Literal["AUTO_TEMPLATE", "MANUAL"] = "AUTO_TEMPLATE"
@@ -434,6 +549,10 @@ class TrackCentroidConfig(BaseModel):
     arena_roi: ArenaROIConfig = Field(
         default_factory=ArenaROIConfig,
         description="Optional arena region-of-interest mask to restrict tracking.",
+    )
+    arena_crop: ArenaCropConfig = Field(
+        default_factory=ArenaCropConfig,
+        description="Optional arena crop to run tracking on maze-only region.",
     )
     key_frame_interpolation: KeyFrameInterpolationConfig = Field(
         default_factory=KeyFrameInterpolationConfig,

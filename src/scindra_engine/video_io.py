@@ -248,6 +248,139 @@ def require_ffmpeg_available() -> None:
         )
 
 
+def get_display_dimensions(width: int, height: int, dar: str | None) -> tuple[int, int]:
+    """Return (new_width, new_height) so that new_w/new_h matches DAR (avoids distortion).
+
+    When video has non-square pixels, decoded frame size (width, height) may not match
+    display aspect ratio. Use this to get dimensions for resizing so PNG/video output
+    displays with correct proportions. Returns (width, height) unchanged if dar is None
+    or invalid.
+    """
+    if not dar or width <= 0 or height <= 0:
+        return (width, height)
+    try:
+        parts = dar.strip().split(":")
+        if len(parts) != 2:
+            return (width, height)
+        w_ratio = float(parts[0])
+        h_ratio = float(parts[1])
+    except (ValueError, AttributeError):
+        return (width, height)
+    if w_ratio <= 0 or h_ratio <= 0:
+        return (width, height)
+    target_ratio = w_ratio / h_ratio
+    current_ratio = width / height
+    if abs(current_ratio - target_ratio) < 0.01:
+        return (width, height)
+    if current_ratio > target_ratio:
+        new_w = int(round(height * target_ratio))
+        return (new_w, height)
+    new_h = int(round(width / target_ratio))
+    return (width, new_h)
+
+
+def resize_to_display_aspect(frame: np.ndarray, dar: str | None) -> np.ndarray:
+    """Resize frame so width/height matches display aspect ratio (prevents stretched PNGs).
+
+    Use when writing frame buffers to PNG so they match the video's intended display
+    proportions. Returns frame unchanged if dar is None or invalid.
+    """
+    if not dar or frame.size == 0:
+        return frame
+    h, w = frame.shape[:2]
+    new_w, new_h = get_display_dimensions(w, h, dar)
+    if (new_w, new_h) == (w, h):
+        return frame
+    return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
+def crop_to_display_aspect(
+    frame: np.ndarray,
+    crop_xyxy: tuple[int, int, int, int],
+    dar: str | None,
+) -> np.ndarray:
+    """Crop the frame to crop_xyxy and return an image with correct display aspect ratio.
+
+    When the video has non-square pixels, cropping raw frames yields distorted crops.
+    This resizes the full frame to DAR, maps crop_xyxy into the resized image, then
+    crops there so the written PNG displays with correct proportions.
+
+    Args:
+        frame: Full BGR frame at decoded resolution.
+        crop_xyxy: (x1, y1, x2, y2) in original frame coordinates.
+        dar: Display aspect ratio (e.g. '16:9') or None to crop without resizing.
+
+    Returns:
+        Cropped region with correct aspect ratio (no stretch).
+    """
+    if not dar or frame.size == 0:
+        x1, y1, x2, y2 = crop_xyxy
+        return frame[y1:y2, x1:x2].copy()
+    h, w = frame.shape[:2]
+    resized = resize_to_display_aspect(frame, dar)
+    rw = resized.shape[1]
+    rh = resized.shape[0]
+    scale_x = rw / w
+    scale_y = rh / h
+    x1, y1, x2, y2 = crop_xyxy
+    x1_s = int(round(x1 * scale_x))
+    y1_s = int(round(y1 * scale_y))
+    x2_s = int(round(x2 * scale_x))
+    y2_s = int(round(y2 * scale_y))
+    x1_s = max(0, min(x1_s, rw - 1))
+    y1_s = max(0, min(y1_s, rh - 1))
+    x2_s = max(x1_s + 1, min(x2_s, rw))
+    y2_s = max(y1_s + 1, min(y2_s, rh))
+    return resized[y1_s:y2_s, x1_s:x2_s].copy()
+
+
+def draw_crop_box_for_display(
+    frame: np.ndarray,
+    crop_xyxy: tuple[int, int, int, int],
+    dar: str | None,
+    label: str = "Arena crop (detected)",
+) -> np.ndarray:
+    """Draw the crop box on the frame for display. When dar is set, draws in DAR space. If the crop is square in source pixels, draws a square in output space so it appears square (avoids stretch when sx != sy)."""
+    x1, y1, x2, y2 = crop_xyxy
+    if dar and frame.size > 0:
+        h, w = frame.shape[:2]
+        out = resize_to_display_aspect(frame.copy(), dar)
+        rw, rh = out.shape[1], out.shape[0]
+        sx, sy = rw / w, rh / h
+        crop_w, crop_h = x2 - x1, y2 - y1
+        if crop_w == crop_h:
+            # Crop is square in source: draw a square in output so it looks square
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            side_out = min(crop_w * sx, crop_h * sy)
+            x1_d = int(round(cx * sx - side_out / 2))
+            y1_d = int(round(cy * sy - side_out / 2))
+            x2_d = int(round(cx * sx + side_out / 2))
+            y2_d = int(round(cy * sy + side_out / 2))
+        else:
+            x1_d = int(round(x1 * sx))
+            y1_d = int(round(y1 * sy))
+            x2_d = int(round(x2 * sx))
+            y2_d = int(round(y2 * sy))
+        cv2.rectangle(out, (x1_d, y1_d), (x2_d, y2_d), (0, 255, 0), 2)
+        cv2.putText(out, label, (x1_d, max(20, y1_d - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+        return out
+    out = frame.copy()
+    cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    cv2.putText(out, label, (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+    return out
+
+
+def ensure_square_image(img: np.ndarray) -> np.ndarray:
+    """Return a centered square crop of img (side = min(width, height)). No-op if already square."""
+    h, w = img.shape[:2]
+    if w == h:
+        return img
+    side = min(w, h)
+    x0 = (w - side) // 2
+    y0 = (h - side) // 2
+    return img[y0 : y0 + side, x0 : x0 + side].copy()
+
+
 def get_video_display_aspect_ratio(video_path: str | Path) -> str | None:
     """Return the display aspect ratio (e.g. '9:16') from the first video stream via ffprobe.
 

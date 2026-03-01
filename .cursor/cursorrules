@@ -155,6 +155,10 @@ FILE + OUTPUT CONVENTIONS
   - output hashes
   - warnings list.
 
+- Image and video outputs must honour the correct pixel/display aspect ratio:
+  - When writing PNGs or video frames derived from a video source, use the video's display aspect ratio (DAR) so outputs are not stretched or squashed. Use video_io.resize_to_display_aspect for full-frame outputs and video_io.crop_to_display_aspect for cropped regions.
+  - Arena crop outputs (static, edges, box, cropped), overlays, heatmaps, and any other image/video artifacts must preserve correct proportions. Never write raw decoded frames or raw crops when the source has non-square pixels without first resizing/cropping in DAR space.
+
 ========================
 RELEASE SMOKE GATE (MANDATORY BEFORE COMPLETING)
 ========================

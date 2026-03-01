@@ -16,6 +16,7 @@ def write_heatmap_png(
     out_path: str,
     *,
     blur_ksize: int = 31,
+    display_aspect_ratio: str | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> None:
     """Write a heatmap PNG showing spatial density of centroids.
@@ -26,6 +27,7 @@ def write_heatmap_png(
         track_points: List of TrackPoint objects for the video.
         out_path: Path to the output PNG file.
         blur_ksize: Odd kernel size for Gaussian blur.
+        display_aspect_ratio: If set (e.g. '16:9'), resize heatmap to match so proportions match the video.
     """
     if width <= 0 or height <= 0:
         raise ValueError("width and height must be positive integers")
@@ -70,6 +72,13 @@ def write_heatmap_png(
         heatmap_uint8 = heatmap_norm.astype(np.uint8)
 
     colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+
+    if display_aspect_ratio:
+        from scindra_engine.video_io import get_display_dimensions
+
+        new_w, new_h = get_display_dimensions(width, height, display_aspect_ratio)
+        if (new_w, new_h) != (width, height):
+            colored = cv2.resize(colored, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
     if not cv2.imwrite(str(dst_path), colored):
         raise RuntimeError(f"Failed to write heatmap PNG to {dst_path}")
