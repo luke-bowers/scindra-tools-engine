@@ -170,9 +170,14 @@ def arena_crop_test(
     hough_max_radius_ratio: float | None = typer.Option(None, "--hough-max-radius", min=0.1, max=0.99, help="Hough max radius as fraction of min(w,h)"),
     hough_acc_threshold: int | None = typer.Option(None, "--hough-acc-threshold", min=5, max=100, help="Hough accumulator threshold; lower = more sensitive"),
     circle_only: bool = typer.Option(False, "--circle-only/--contour-fallback", help="Only use circle detection; no contour fallback"),
-    arena_type: str | None = typer.Option(None, "--arena-type", help="Arena type: elevated-zero (circular/ring) or open-field (white box). Overrides config."),
+    arena_type: str | None = typer.Option(None, "--arena-type", help="Arena type: elevated-zero (circular/ring), open-field (white box), or elevated-plus (cross-shaped). Overrides config."),
     open_field_white_threshold: int | None = typer.Option(None, "--open-field-white-threshold", min=0, max=255, help="Open-field only: grayscale threshold for white (0=Otsu). Overrides config."),
     open_field_min_area_ratio: float | None = typer.Option(None, "--open-field-min-area-ratio", min=0.0, max=1.0, help="Open-field only: min contour area as fraction of frame. Overrides config."),
+    plus_maze_arm_length_ratio: float | None = typer.Option(None, "--plus-maze-arm-length-ratio", min=0.1, max=0.8, help="Elevated-plus only: expected arm length as fraction of frame size. Overrides config."),
+    plus_maze_arm_width_ratio: float | None = typer.Option(None, "--plus-maze-arm-width-ratio", min=0.05, max=0.5, help="Elevated-plus only: expected arm width as fraction of arm length. Overrides config."),
+    plus_maze_center_size_ratio: float | None = typer.Option(None, "--plus-maze-center-size-ratio", min=0.05, max=0.4, help="Elevated-plus only: expected center platform size as fraction of arm length. Overrides config."),
+    plus_maze_aspect_tolerance: float | None = typer.Option(None, "--plus-maze-aspect-tolerance", min=0.1, max=0.8, help="Elevated-plus only: tolerance for arm length variations. Overrides config."),
+    plus_maze_min_area_ratio: float | None = typer.Option(None, "--plus-maze-min-area-ratio", min=0.01, max=0.5, help="Elevated-plus only: minimum total maze area as fraction of frame. Overrides config."),
     debug_out: Path | None = typer.Option(None, "--debug-out", file_okay=False, help="Write pipeline step images and manifest to this directory (what the pipeline sees at each step)"),
 ) -> None:
     """Test arena detection on a video or single image without running full tracking.
@@ -223,6 +228,11 @@ def arena_crop_test(
     open_field_white_threshold_val = 200
     open_field_min_area_ratio_val = 0.02
     open_field_rectangularity_min_val = 0.6
+    plus_maze_arm_length_ratio_val = 0.3
+    plus_maze_arm_width_ratio_val = 0.2
+    plus_maze_center_size_ratio_val = 0.15
+    plus_maze_aspect_tolerance_val = 0.3
+    plus_maze_min_area_ratio_val = 0.08
     if config_path is not None:
         data = _load_config(config_path)
         try:
@@ -247,6 +257,11 @@ def arena_crop_test(
             open_field_white_threshold_val = getattr(ac, "open_field_white_threshold", 200)
             open_field_min_area_ratio_val = getattr(ac, "open_field_min_area_ratio", 0.02)
             open_field_rectangularity_min_val = getattr(ac, "open_field_rectangularity_min", 0.6)
+            plus_maze_arm_length_ratio_val = getattr(ac, "plus_maze_arm_length_ratio", 0.3)
+            plus_maze_arm_width_ratio_val = getattr(ac, "plus_maze_arm_width_ratio", 0.2)
+            plus_maze_center_size_ratio_val = getattr(ac, "plus_maze_center_size_ratio", 0.15)
+            plus_maze_aspect_tolerance_val = getattr(ac, "plus_maze_aspect_tolerance", 0.3)
+            plus_maze_min_area_ratio_val = getattr(ac, "plus_maze_min_area_ratio", 0.08)
         except Exception as e:
             typer.echo(f"Warning: could not load arena_crop from config: {e}", err=True)
     if canny_low is not None:
@@ -275,14 +290,24 @@ def arena_crop_test(
         circle_only_val = True
     if arena_type is not None:
         at = arena_type.strip().lower().replace("-", "_")
-        if at in ("elevated_zero", "open_field"):
+        if at in ("elevated_zero", "open_field", "elevated_plus"):
             arena_type_val = at
         else:
-            typer.echo(f"Warning: --arena-type must be elevated-zero or open-field (got {arena_type!r}), using {arena_type_val!r}", err=True)
+            typer.echo(f"Warning: --arena-type must be elevated-zero, open-field, or elevated-plus (got {arena_type!r}), using {arena_type_val!r}", err=True)
     if open_field_white_threshold is not None:
         open_field_white_threshold_val = open_field_white_threshold
     if open_field_min_area_ratio is not None:
         open_field_min_area_ratio_val = open_field_min_area_ratio
+    if plus_maze_arm_length_ratio is not None:
+        plus_maze_arm_length_ratio_val = plus_maze_arm_length_ratio
+    if plus_maze_arm_width_ratio is not None:
+        plus_maze_arm_width_ratio_val = plus_maze_arm_width_ratio
+    if plus_maze_center_size_ratio is not None:
+        plus_maze_center_size_ratio_val = plus_maze_center_size_ratio
+    if plus_maze_aspect_tolerance is not None:
+        plus_maze_aspect_tolerance_val = plus_maze_aspect_tolerance
+    if plus_maze_min_area_ratio is not None:
+        plus_maze_min_area_ratio_val = plus_maze_min_area_ratio
 
     dar: str | None = None
     if video is not None:
@@ -358,6 +383,11 @@ def arena_crop_test(
         open_field_white_threshold=open_field_white_threshold_val,
         open_field_min_area_ratio=open_field_min_area_ratio_val,
         open_field_rectangularity_min=open_field_rectangularity_min_val,
+        plus_maze_arm_length_ratio=plus_maze_arm_length_ratio_val,
+        plus_maze_arm_width_ratio=plus_maze_arm_width_ratio_val,
+        plus_maze_center_size_ratio=plus_maze_center_size_ratio_val,
+        plus_maze_aspect_tolerance=plus_maze_aspect_tolerance_val,
+        plus_maze_min_area_ratio=plus_maze_min_area_ratio_val,
     )
     if box is not None and crop_expand_ratio_val > 0:
         h, w = static_img.shape[:2]

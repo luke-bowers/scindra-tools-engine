@@ -159,9 +159,9 @@ class ArenaCropConfig(BaseModel):
         default="contour",
         description="Arena detection method (classical contour-based).",
     )
-    arena_type: Literal["elevated_zero", "open_field"] = Field(
+    arena_type: Literal["elevated_zero", "open_field", "elevated_plus"] = Field(
         default="elevated_zero",
-        description="elevated_zero: circular/ring mazes (edge-based + Hough/contour). open_field: white rectangular box (brightness threshold + largest region).",
+        description="elevated_zero: circular/ring mazes (edge-based + Hough/contour). open_field: white rectangular box (brightness threshold + largest region). elevated_plus: plus/cross-shaped mazes (edge-based with cross pattern detection).",
     )
     open_field_white_threshold: int = Field(
         default=200,
@@ -180,6 +180,36 @@ class ArenaCropConfig(BaseModel):
         ge=0.0,
         le=1.0,
         description="Open-field only: min contour_area/bbox_area to prefer box-like shapes.",
+    )
+    plus_maze_arm_length_ratio: float = Field(
+        default=0.3,
+        ge=0.1,
+        le=0.8,
+        description="Elevated-plus only: expected arm length as fraction of frame size (min dimension).",
+    )
+    plus_maze_arm_width_ratio: float = Field(
+        default=0.2,
+        ge=0.05,
+        le=0.5,
+        description="Elevated-plus only: expected arm width as fraction of arm length.",
+    )
+    plus_maze_center_size_ratio: float = Field(
+        default=0.15,
+        ge=0.05,
+        le=0.4,
+        description="Elevated-plus only: expected center platform size as fraction of arm length.",
+    )
+    plus_maze_aspect_tolerance: float = Field(
+        default=0.3,
+        ge=0.1,
+        le=0.8,
+        description="Elevated-plus only: tolerance for arm length variations and asymmetry.",
+    )
+    plus_maze_min_area_ratio: float = Field(
+        default=0.08,
+        ge=0.01,
+        le=0.5,
+        description="Elevated-plus only: minimum total maze area as fraction of frame area.",
     )
     margin_px: int = Field(
         default=0,

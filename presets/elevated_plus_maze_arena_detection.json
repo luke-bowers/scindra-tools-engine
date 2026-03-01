@@ -1,0 +1,46 @@
+{
+  "downsample_factor": 2,
+  "tracking": {
+    "kalman_coast_frames": 2,
+    "kalman_process_noise": 1,
+    "min_area_px": 5
+  },
+  "detector": {
+    "enabled": true,
+    "model_path": "models/yolox_mouse_640.onnx",
+    "min_score": 0.35,
+    "every_n_frames": 20,
+    "reacquire_on_low_tracking_conf": true,
+    "roi_padding_ratio": 0.5,
+    "max_roi_jump_ratio": 1,
+    "fallback_to_classical_full_frame": true,
+    "write_detector_debug_frames": true,
+    "detector_debug_frame_count": 15,
+    "precompute_roi_parallel": true,
+    "start_tracking_after_first_detection": true,
+    "max_detector_bbox_area_px": 50000
+  },
+  "arena_crop": {
+    "enabled": true,
+    "mode": "AUTO",
+    "n_frames_static": 50,
+    "static_method": "median",
+    "detection_method": "contour",
+    "arena_type": "elevated_plus",
+    "plus_maze_arm_length_ratio": 0.3,
+    "plus_maze_arm_width_ratio": 0.2,
+    "plus_maze_center_size_ratio": 0.15,
+    "plus_maze_aspect_tolerance": 0.3,
+    "plus_maze_min_area_ratio": 0.03,
+    "margin_px": 5,
+    "canny_low": 20,
+    "canny_high": 80,
+    "blur_ksize": 5,
+    "morph_close_ksize": 15,
+    "crop_expand_ratio": 0.05,
+    "debug_output_dir": "out/debug_arena"
+  },
+  "debug_mode": true,
+  "debug_frame_interval": 30,
+  "debug_max_frames": 100
+}

@@ -284,6 +284,115 @@ def _detect_arena_open_field(
     return ((int(x1), int(y1), int(x2), int(y2)), binary, chosen_bbox)
 
 
+def _detect_arena_elevated_plus(
+    static_image_bgr: np.ndarray,
+    w: int,
+    h: int,
+    margin_px: int,
+    plus_maze_arm_length_ratio: float,
+    plus_maze_arm_width_ratio: float,
+    plus_maze_center_size_ratio: float,
+    plus_maze_aspect_tolerance: float,
+    plus_maze_min_area_ratio: float,
+    canny_low: int,
+    canny_high: int,
+    blur_ksize: int,
+    morph_close_ksize: int,
+) -> tuple[tuple[int, int, int, int] | None, np.ndarray, tuple[int, int, int, int] | None]:
+    """Detect elevated plus maze as cross-shaped bright structure. Returns (box, edges, chosen_bbox)."""
+    # Convert to grayscale
+    gray = (
+        cv2.cvtColor(static_image_bgr, cv2.COLOR_BGR2GRAY)
+        if static_image_bgr.ndim == 3
+        else static_image_bgr
+    )
+    
+    # Apply blur
+    k = max(1, blur_ksize if blur_ksize % 2 == 1 else blur_ksize + 1)
+    blurred = cv2.GaussianBlur(gray, (k, k), 0)
+    
+    # Edge detection
+    edges = cv2.Canny(blurred, canny_low, canny_high)
+    
+    # Morphological operations to enhance cross structure
+    if morph_close_ksize > 0:
+        kernel_size = max(3, morph_close_ksize if morph_close_ksize % 2 == 1 else morph_close_ksize + 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+    
+    # Find contours
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Calculate expected dimensions
+    min_dim = min(w, h)
+    expected_arm_length = int(min_dim * plus_maze_arm_length_ratio)
+    expected_arm_width = int(expected_arm_length * plus_maze_arm_width_ratio)
+    expected_center_size = int(expected_arm_length * plus_maze_center_size_ratio)
+    
+    area_total = w * h
+    min_area = max(500, int(area_total * plus_maze_min_area_ratio))
+    
+    # Look for plus-shaped contours
+    candidates = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < min_area:
+            continue
+            
+        # Get bounding rectangle
+        x1, y1, cw, ch = cv2.boundingRect(contour)
+        
+        # Basic size validation
+        if cw < expected_arm_length * 0.5 or ch < expected_arm_length * 0.5:
+            continue
+            
+        # Check if the contour could form a plus shape
+        # A plus should have roughly equal width and height
+        aspect_ratio = max(cw, ch) / min(cw, ch)
+        if aspect_ratio > (1.0 + plus_maze_aspect_tolerance):
+            continue
+        
+        # Calculate center point
+        cx = x1 + cw // 2
+        cy = y1 + ch // 2
+        
+        # Create a mask for this contour to analyze its shape
+        mask = np.zeros(gray.shape, dtype=np.uint8)
+        cv2.fillPoly(mask, [contour], 255)
+        
+        # Check for plus-like properties by analyzing structure
+        # Sample points along horizontal and vertical lines through center
+        h_line_coverage = np.sum(mask[cy, max(0, cx - cw//2):min(w, cx + cw//2)] > 0) / min(cw, w - max(0, cx - cw//2))
+        v_line_coverage = np.sum(mask[max(0, cy - ch//2):min(h, cy + ch//2), cx] > 0) / min(ch, h - max(0, cy - ch//2))
+        
+        # A plus should have good coverage along both axes
+        cross_score = min(h_line_coverage, v_line_coverage)
+        
+        # Prefer contours with good cross coverage and appropriate size
+        score = area * cross_score * (1.0 / aspect_ratio)  # Penalty for non-square shapes
+        candidates.append((contour, area, score, x1, y1, cw, ch))
+    
+    if not candidates:
+        return (None, edges, None)
+    
+    # Choose the best candidate (highest score)
+    best_contour, best_area, best_score, x1, y1, cw, ch = max(candidates, key=lambda x: x[2])
+    
+    # Calculate final bounding box with margins
+    x2 = x1 + cw
+    y2 = y1 + ch
+    x1 = max(0, x1 - margin_px)
+    y1 = max(0, y1 - margin_px)
+    x2 = min(w, x2 + margin_px)
+    y2 = min(h, y2 + margin_px)
+    
+    if x2 <= x1 or y2 <= y1:
+        return (None, edges, None)
+    
+    chosen_bbox = (int(x1), int(y1), int(x2), int(y2))
+    return ((int(x1), int(y1), int(x2), int(y2)), edges, chosen_bbox)
+
+
 def detect_arena_crop_xyxy(
     static_image_bgr: np.ndarray,
     margin_px: int = 0,
@@ -306,6 +415,11 @@ def detect_arena_crop_xyxy(
     open_field_white_threshold: int = 200,
     open_field_min_area_ratio: float = 0.02,
     open_field_rectangularity_min: float = 0.6,
+    plus_maze_arm_length_ratio: float = 0.3,
+    plus_maze_arm_width_ratio: float = 0.2,
+    plus_maze_center_size_ratio: float = 0.15,
+    plus_maze_aspect_tolerance: float = 0.3,
+    plus_maze_min_area_ratio: float = 0.08,
 ) -> tuple[tuple[int, int, int, int] | None, tuple[int, int, int] | None]:
     """Detect the most likely arena bounding box from a static BGR image.
 
@@ -390,6 +504,46 @@ def detect_arena_crop_xyxy(
                 "mask": mask,
                 "chosen_bbox": list(chosen_bbox) if chosen_bbox else None,
                 "description": "Open-field: white region mask; green box = chosen crop",
+            })
+        return (box, None)
+    
+    # Elevated-plus path: edge detection + cross pattern analysis
+    if arena_type == "elevated_plus":
+        box, edges, chosen_bbox = _detect_arena_elevated_plus(
+            static_image_bgr,
+            w,
+            h,
+            margin_px,
+            plus_maze_arm_length_ratio,
+            plus_maze_arm_width_ratio,
+            plus_maze_center_size_ratio,
+            plus_maze_aspect_tolerance,
+            plus_maze_min_area_ratio,
+            canny_low,
+            canny_high,
+            blur_ksize,
+            morph_close_ksize,
+        )
+        if debug_callback is not None:
+            overlay = static_image_bgr.copy()
+            if chosen_bbox is not None:
+                x1, y1, x2, y2 = chosen_bbox
+                cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(
+                    overlay,
+                    "Plus maze crop (detected)",
+                    (x1, max(20, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+            debug_callback("elevated_plus", {
+                "image": overlay,
+                "mask": edges,
+                "chosen_bbox": list(chosen_bbox) if chosen_bbox else None,
+                "description": "Elevated-plus: edge map; green box = chosen crop",
             })
         return (box, None)
 
